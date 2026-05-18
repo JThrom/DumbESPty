@@ -1,0 +1,26 @@
+.DS_Store
+
+# ESP-IDF generated outputs
+build/
+.idf/
+managed_components/
+
+# ESP-IDF generated configs/locks
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# Build/log artifacts sometimes emitted at project root
+*.bin
+*.elf
+*.map
+flasher_args.json
+flash_args
+build.log
+
+# Local binaries and scratch outputs
+*.out
+a.out
+
+# Experimental local assets
+main/assets/
