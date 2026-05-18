@@ -1,5 +1,5 @@
 set(srcs
-    "deck_base.cpp"
+    "console_base.cpp"
     "waveshare_display.cpp"
     "ch422g_init.cpp"
     "coex_manager.cpp"

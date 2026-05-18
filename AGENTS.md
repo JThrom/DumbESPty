@@ -34,7 +34,7 @@ idf.py -p /dev/ttyACM1 monitor
 Current compiled sources are defined in `main/CMakeLists.txt`.
 
 Core modules in active use:
-- `main/deck_base.cpp`
+- `main/console_base.cpp`
 - `main/terminal.cpp`, `main/terminal.hpp`
 - `main/ssh_client.cpp`, `main/ssh_client.hpp`
 - `main/shell.cpp`, `main/shell.hpp`

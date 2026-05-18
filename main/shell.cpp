@@ -331,7 +331,7 @@ static void cmd_about_handler(int argc, char **argv) {
     shell_print(app_desc->version);
     shell_print("\r\n\033[38;2;255;212;120m    Author:\033[0m Jason Throm");
     shell_print("\r\n\033[38;2;255;212;120m    GitHub:\033[0m https://github.com/JThrom/DumbESPty");
-    shell_print("\r\n\033[38;2;255;212;120m    License:\033[0m GNU General Public License v2.0");
+    shell_print("\r\n\033[38;2;255;212;120m    License:\033[0m GNU/GPL v2");
     shell_print("\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel, terminal grid 100 x 32, cell 8 x 15");
     shell_print("\r\n\033[38;2;255;212;120m    Controller helper:\033[0m CH422G I2C expander init path enabled");
 

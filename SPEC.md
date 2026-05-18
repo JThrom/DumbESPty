@@ -16,7 +16,7 @@ rendering stability.
 ## Runtime Architecture
 
 ```text
-deck_base.cpp
+console_base.cpp
   -> terminal (parser + renderer)
   -> shell (local CLI + SSH passthrough)
   -> ssh_client (libssh2 session + recv queue)
@@ -164,4 +164,3 @@ Status:
 ## Branch Safety
 
 Working branch: `master`
-

@@ -36,7 +36,7 @@ Primary integration goal in the current phase: keep LazyVim rendering stable whi
 ## Runtime Architecture
 
 ```text
-deck_base.cpp
+console_base.cpp
   -> terminal (parser + renderer)
   -> shell (local CLI + SSH passthrough)
   -> ssh_client (libssh2 session + recv queue)
@@ -59,7 +59,7 @@ Compiled source set is defined in `main/CMakeLists.txt`.
 
 Core modules in active use:
 
-- `main/deck_base.cpp`
+- `main/console_base.cpp`
 - `main/terminal.cpp`, `main/terminal.hpp`
 - `main/ssh_client.cpp`, `main/ssh_client.hpp`
 - `main/shell.cpp`, `main/shell.hpp`
@@ -148,7 +148,7 @@ The `about` command prints a full-color info screen including:
 - DumbESPty version: runtime app metadata (currently `1.0.0`)
 - Author: `Jason Throm`
 - GitHub: `https://github.com/JThrom/DumbESPty`
-- License: `GNU General Public License v2.0`
+- License: `GNU/GPL v2`
 - Display details: `7-inch RGB panel`, terminal grid `100 x 32`, cell `8 x 15`
 - Controller helper: `CH422G I2C expander init path enabled`
 - MCU: ESP32-S3 (dual-core Xtensa LX7, Wi-Fi + BLE)
