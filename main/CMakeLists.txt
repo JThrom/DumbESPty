@@ -5,6 +5,7 @@ set(srcs
     "coex_manager.cpp"
     "ble_hid_host.cpp"
     "shell.cpp"
+    "ui_status_menu.cpp"
     "wifi_mgr.cpp"
     "ssh_client.cpp"
     "terminal.cpp"

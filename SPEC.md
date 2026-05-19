@@ -54,11 +54,13 @@ Compatibility implemented for active editor/shell scenarios:
 - DECRQM query response (`CSI ? Ps $ p` -> `CSI ? Ps;0$y`)
 - `CSI ?u` handled distinctly from restore-cursor `CSI u`
 - Keypad mode escapes `ESC >` / `ESC =` consumed correctly
+- `CSI X` (Erase Character) implemented
+- `CSI > ... q` and `CSI > ... u` variants consumed to reduce compatibility warning noise
 
 Rendering notes:
 - Uses Cozette bitmap font with LVGL fallback font path
 - Fixed grid target currently tuned for compact editor use (`100x32`, `8x15`)
-- Icon fallback remaps currently include `U+F426` and `U+E348` to `U+F15B`
+- Icon fallback remaps currently include `U+F426`, `U+E348`, `U+F0B37`, `U+F12B7`, and `U+F1064` to `U+F15B`
 
 ### SSH Client (`main/ssh_client.cpp`, `main/ssh_client.hpp`)
 
@@ -86,6 +88,26 @@ Stability hardening:
 - BLE keyboard scan/connect/report handling
 - Key translation into shell input stream
 - Enter and keypad Enter both mapped to carriage return (`\r`)
+- Manual keyboard scan API for UI list-based pairing
+- Single-device persistent pairing in NVS (`blehid`) with prefix/name/slot and optional full BLE address
+- Auto reconnect path:
+  - direct reconnect by saved full address when available,
+  - fallback scan/connect via saved prefix
+- FN-layer ESC compatibility path for keyboards that emit vendor-style short reports (e.g. `00 80 00`)
+- HID usage table corrected to preserve index alignment (including required `0x32` placeholder) so punctuation keys map correctly
+
+### Status Menu UI (`main/ui_status_menu.cpp`, `main/ui_status_menu.hpp`)
+
+- Touch-open status drawer with outside-tap dismiss
+- Dark-themed Wi-Fi/BLE controls
+- BLE flow:
+  - `Scan` shown when unpaired,
+  - list rows shown as `Keyboard #`,
+  - `Disconnect` shown when paired
+- Wi-Fi label formatting:
+  - connected: `WiFi: <ssid>`
+  - disconnected: `WiFi: disconnected`
+- Battery status/icon currently hidden in UI (feature code retained)
 
 ### Wi-Fi Manager (`main/wifi_mgr.cpp`)
 
@@ -160,6 +182,13 @@ Status:
 - LazyVim main screen loads after DCS rollback.
 - Updated Nerd symbol font includes the three known missing glyphs.
 - Firmware builds and flashes successfully to `/dev/ttyACM1`.
+
+## Known Quirks and Workarounds
+
+- BLE coexistence with Wi-Fi/SSH: during network acquire/release windows, BLE scan may pause and active BLE HID connection may be terminated.
+- Practical symptom: keyboard can appear disconnected after Wi-Fi connect or SSH activity.
+- Current expected recovery: press any key on keyboard to wake/re-trigger reconnect.
+- This is a known tradeoff in the current coexistence model and is documented behavior, not a random regression.
 
 ## Branch Safety
 

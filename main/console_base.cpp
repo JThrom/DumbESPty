@@ -2,6 +2,7 @@
 #include "waveshare_display.hpp"
 #include "ble_hid_host.hpp"
 #include "shell.hpp"
+#include "ui_status_menu.hpp"
 #include "wifi_mgr.hpp"
 #include "ssh_client.hpp"
 #include "terminal.hpp"
@@ -12,7 +13,7 @@
 #include "nvs_flash.h"
 #include "lvgl.h"
 
-static const char *TAG = "deck";
+static const char *TAG = "console";
 static lv_obj_t *status_label = NULL;
 static terminal_t terminal;
 
@@ -122,12 +123,18 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "BLE HID Host init OK");
     }
 
+    ret = ui_status_menu_init(lv_scr_act());
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Touch/status menu init failed: %s", esp_err_to_name(ret));
+    }
+
     while (1) {
         ble_hid_process_queue();
         lv_obj_clear_flag(terminal.canvas, LV_OBJ_FLAG_HIDDEN);
 
         wifi_mgr_process_queue();
         ssh_process_queue();
+        ui_status_menu_update();
         terminal_render(&terminal);
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(10));

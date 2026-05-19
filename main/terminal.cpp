@@ -603,6 +603,12 @@ static void csi_dispatch(terminal_t *term) {
         delete_lines(term, pop_param(term, 0, 1));
     } else if (f == 'P') {
         delete_chars(term, pop_param(term, 0, 1));
+    } else if (f == 'X') {
+        int n = pop_param(term, 0, 1);
+        if (n < 1) n = 1;
+        int c2 = term->cursor_col + n - 1;
+        if (c2 >= term->cols) c2 = term->cols - 1;
+        clear_area(term, term->cursor_row, term->cursor_col, term->cursor_row, c2);
     } else if (f == '@') {
         insert_chars(term, pop_param(term, 0, 1));
     } else if (f == 'S') {
@@ -623,6 +629,8 @@ static void csi_dispatch(terminal_t *term) {
         dirty_cell(term, term->cursor_row, term->cursor_col);
     } else if (f == 'u' && term->question_mark) {
         if (term->output_cb) term->output_cb("\033[?0u", 5);
+    } else if (f == 'u' && term->greater_than) {
+        // Kitty keyboard protocol enable/disable/query; ignore for now.
     } else if (f == 'n') {
         int q = pop_param(term, 0, 0);
         ESP_LOGI(TAG, "CSI %s%d n", term->question_mark ? "?" : "", q);
@@ -698,7 +706,7 @@ static void csi_dispatch(terminal_t *term) {
             term->cursor_col = 0;
             dirty_cell(term, term->cursor_row, term->cursor_col);
         }
-    } else if (f == 'q' && term->csi_intermediate == ' ') {
+    } else if (f == 'q' && (term->csi_intermediate == ' ' || term->greater_than)) {
         // DECSCUSR cursor style; accept and ignore.
     } else if (f == 'p' && term->question_mark && term->csi_intermediate == '$') {
         int mode = pop_param(term, 0, 0);
@@ -1001,6 +1009,9 @@ static void draw_cell_glyph(const terminal_t *term,
                             uint16_t surface_bg) {
     if (code == 0xE348) code = 0xF15B;
     if (code == 0xF426) code = 0xF15B;
+    if (code == 0xF0B37) code = 0xF15B;
+    if (code == 0xF12B7) code = 0xF15B;
+    if (code == 0xF1064) code = 0xF15B;
     if (code < 0x20) return;
 
     uint16_t fg = compensate_text_color(color, surface_bg);

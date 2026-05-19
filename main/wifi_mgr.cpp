@@ -264,6 +264,10 @@ bool wifi_mgr_is_connected(void) {
     return connected;
 }
 
+const char *wifi_mgr_get_ssid(void) {
+    return current_ssid;
+}
+
 void wifi_mgr_get_status(char *buf, size_t len) {
     if (connected) {
         snprintf(buf, len, "connected to %s", current_ssid);
