@@ -71,6 +71,27 @@ Active font assets:
    - If new `Missing glyph U+....` warnings appear, add exact codepoints to
      font generation range and reflash.
 
+## Input Compatibility Notes
+
+- ESC can be keyboard-specific:
+  - Some compact keyboards emit `Fn+Esc` via short vendor-style reports
+    (for example `00 80 00`) instead of HID keycode `0x29`.
+  - The BLE host includes an ESC surrogate mapping for this path.
+  - Do not remove this mapping unless replacing it with full HID
+    report-descriptor parsing.
+
+- HID usage mapping table must remain index-aligned:
+  - The `hid_to_ascii` table in `main/ble_hid_host.cpp` is indexed by usage
+    code and must keep placeholder slots (notably usage `0x32`, Non-US key).
+  - Removing placeholder entries shifts punctuation mappings and breaks `/`,
+    `;`, and related keys.
+
+## Coexistence Quirk (Current)
+
+- BLE keyboard may disconnect or pause after Wi-Fi connect / SSH activity.
+- This is expected with current coexistence acquire/release behavior.
+- In practice, press any key on the keyboard to wake and trigger reconnect.
+
 ## Regressions to Avoid
 
 - Do not reintroduce DCS parser-state extensions that break LazyVim screen

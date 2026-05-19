@@ -25,6 +25,39 @@ DumbESPty is a portable, color dumb-terminal style system built on a Waveshare 7
 
 Primary integration goal in the current phase: keep LazyVim rendering stable while improving compatibility with modern `zsh`/`oh-my-zsh` and `neovim` terminal behavior (especially DSR-related behavior).
 
+## Recent Feature Additions
+
+- Touch status menu with quick access to Wi-Fi and BLE state.
+- Expanded BLE keyboard management UI:
+  - scan for keyboards,
+  - pair by list selection,
+  - persist single paired keyboard in NVS,
+  - disconnect/forget flow from UI.
+- BLE status labels now use keyboard slot naming (`Keyboard #`) instead of raw device names.
+- Dark-themed status menu controls and improved touch-open hit zones.
+- Terminal parser compatibility updates:
+  - consume `CSI > ... q`/`CSI > ... u` variants without noisy warnings,
+  - implement `CSI X` erase-character,
+  - retain DSR replies in parser and SSH fast path.
+- Glyph fallback remaps expanded for observed Nerd Font gaps.
+
+## Status Menu and BLE Usage
+
+1. Open the status menu from the top status strip touch area.
+2. If no keyboard is paired:
+   - Tap `Scan`.
+   - Tap a `Keyboard #` result to pair/connect.
+3. If a keyboard is paired:
+   - Tap `Disconnect` to disconnect current keyboard.
+   - Use forget flow (when exposed in UI path) to clear pairing and return to scan mode.
+
+Behavior notes:
+
+- Only one BLE keyboard is persisted at a time.
+- Pairing data is stored in NVS (`blehid` namespace), including address prefix and slot metadata.
+- Reconnect prefers full saved address when available, otherwise falls back to prefix-assisted scan/connect.
+- FN-layer ESC compatibility is implemented for keyboards that emit vendor-style short reports instead of HID keycode `0x29`.
+
 ## Project Snapshot
 
 - Project: `DumbESPty`
@@ -95,7 +128,7 @@ Rendering notes:
 
 - Cozette bitmap primary + LVGL fallback flow
 - Grid baseline: `100 x 32`, cell size `8 x 15`
-- Icon fallback remaps include `U+F426` and `U+E348` to `U+F15B`
+- Icon fallback remaps include `U+F426`, `U+E348`, `U+F0B37`, `U+F12B7`, and `U+F1064` to `U+F15B`
 
 ### SSH Client (`main/ssh_client.cpp`, `main/ssh_client.hpp`)
 
@@ -119,6 +152,10 @@ Rendering notes:
 - BLE keyboard scan/connect/report processing
 - Key translation into shell input stream
 - Enter and keypad Enter mapped to carriage return (`\r`)
+- HID usage table alignment fixed for punctuation reliability (`/`, `;`, `'`, etc.)
+- Includes explicit guard comments for:
+  - FN-layer ESC surrogate mapping,
+  - HID usage index alignment (`0x32` placeholder)
 
 ### Wi-Fi Manager (`main/wifi_mgr.cpp`)
 
@@ -211,6 +248,12 @@ idf.py -p /dev/ttyACM1 monitor
 - Keep terminal geometry at `100 x 32`, cell size `8 x 15`.
 - Keep Cozette primary + LVGL fallback flow.
 - Firmware builds and flashes successfully to `/dev/ttyACM1`.
+
+## Known Quirks and Operational Notes
+
+- BLE keyboard may disconnect or appear paused during Wi-Fi connect and active SSH usage because coexistence management can intentionally pause scan/disconnect BLE while network activity is acquired.
+- After Wi-Fi/SSH transitions, some keyboards require a keypress to wake and trigger reconnect.
+- This behavior is currently expected in the active coexistence model; if keyboard input appears dead after SSH/Wi-Fi events, press any key to prompt reconnect.
 
 ## Current Priority Bugs
 

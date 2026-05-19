@@ -164,6 +164,9 @@ void shell_handle_key(char c) {
             else if (c == 0x1E) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'A'; n = 3; }
             else if (c == 0x1F) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'B'; n = 3; }
             else { buf[0] = c; n = 1; }
+            if ((uint8_t)c == 0x1B) {
+                ESP_LOGI(TAG, "SSH key TX: ESC");
+            }
             ssh_write(buf, n);
         }
         return;

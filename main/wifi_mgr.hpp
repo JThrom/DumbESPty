@@ -12,6 +12,7 @@ esp_err_t wifi_mgr_scan(void);
 bool     wifi_mgr_connect(const char *ssid, const char *password);
 esp_err_t wifi_mgr_disconnect(void);
 bool     wifi_mgr_is_connected(void);
+const char *wifi_mgr_get_ssid(void);
 void     wifi_mgr_get_status(char *buf, size_t len);
 void     wifi_mgr_process_queue(void);
 
