@@ -64,6 +64,9 @@ Active font assets:
    - Message: `Did not detect DSR response from terminal`
    - Existing code replies to DSR in both terminal parser and SSH fast path.
    - Remaining issue appears timing/order/capability related.
+   - Host-side check: warning reproduced with both `TERM=xterm` and
+     `TERM=xterm-256color` using `nvim --clean`.
+   - Investigation is currently paused; see `SPEC.md` for full attempt log.
 
 2. Nerd Font gaps:
    - Symbol font was regenerated to include observed missing codepoints:
@@ -98,6 +101,11 @@ Active font assets:
   layout without a clearly isolated and validated fix.
 - A previous XTGETTCAP DCS state-machine attempt caused rendering regression
   and was reverted.
+- Do not reorder parser checks in `ST_GROUND` so C1 control-byte handling runs
+  before UTF-8 continuation handling; this can corrupt Nerd icon glyphs
+  (`U+F15B`/`EF 85 9B`) into stray CSI text like `[12;22H`.
+- Keep private-use icon codepoints routed to the LVGL/Nerd fallback path
+  instead of Cozette bitmap-first lookup to avoid PUA glyph mismatches.
 
 ## Git and Safety Guidance
 

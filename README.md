@@ -14,6 +14,12 @@
 
 # DumbESPty
 
+Name meaning:
+
+- `Dumb`: a classic dumb terminal interaction model.
+- `ESP`: powered by an Espressif ESP32-S3 MCU.
+- `PTY`: pseudo-terminal behavior over SSH (remote shell/editor terminal endpoint).
+
 ## Overview
 
 DumbESPty is a portable, color dumb-terminal style system built on a Waveshare 7-inch ESP32-S3 touch display board. It combines:
@@ -38,8 +44,11 @@ Primary integration goal in the current phase: keep LazyVim rendering stable whi
 - Terminal parser compatibility updates:
   - consume `CSI > ... q`/`CSI > ... u` variants without noisy warnings,
   - implement `CSI X` erase-character,
+  - implement `CSI d` (VPA),
+  - guard UTF-8 continuation handling so bytes like `0x9B` inside icon glyphs are not misparsed as C1 CSI,
   - retain DSR replies in parser and SSH fast path.
 - Glyph fallback remaps expanded for observed Nerd Font gaps.
+- Private-use icon codepoints (Nerd Font ranges) now bypass Cozette bitmap lookup so Nerd symbols are preferred.
 
 ## Status Menu and BLE Usage
 
@@ -260,6 +269,8 @@ idf.py -p /dev/ttyACM1 monitor
 1. Neovim DSR warning
    - Message: `Did not detect DSR response from terminal`
    - DSR replies exist in parser and SSH fast path; issue appears timing/order/capability related.
+   - Reproduced with both `TERM=xterm` and `TERM=xterm-256color` using `nvim --clean`.
+   - Detailed attempt history and rollback notes are tracked in `SPEC.md`.
 
 2. Nerd Font gaps
    - Missing codepoints may still appear in future runs.

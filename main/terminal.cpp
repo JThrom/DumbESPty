@@ -120,6 +120,12 @@ static uint16_t color_256(int idx) {
     return rgb_to_565(gray, gray, gray);
 }
 
+static inline bool is_private_use_codepoint(uint32_t code) {
+    return (code >= 0xE000 && code <= 0xF8FF) ||
+           (code >= 0xF0000 && code <= 0xFFFFD) ||
+           (code >= 0x100000 && code <= 0x10FFFD);
+}
+
 static uint16_t resolve_fg(terminal_t *term) {
     uint16_t c = term->cur_fg;
     if (term->cur_bold && c < 8) c = ansi_colors[c + 8];
@@ -581,6 +587,13 @@ static void csi_dispatch(terminal_t *term) {
         term->cursor_row = r;
         term->cursor_col = c;
         dirty_cell(term, term->cursor_row, term->cursor_col);
+    } else if (f == 'd') {
+        int r = pop_param(term, 0, 1) - 1;
+        if (r < 0) r = 0;
+        if (r >= term->rows) r = term->rows - 1;
+        dirty_cell(term, term->cursor_row, term->cursor_col);
+        term->cursor_row = r;
+        dirty_cell(term, term->cursor_row, term->cursor_col);
     } else if (f == 'J') {
         int mode = pop_param(term, 0, 0);
         if (mode == 0)
@@ -619,6 +632,8 @@ static void csi_dispatch(terminal_t *term) {
         scroll_down_region(term, term->scroll_top, term->scroll_bottom, n);
     } else if (f == 'm' && !term->greater_than) {
         sgr_handler(term);
+    } else if (f == 'm' && term->greater_than) {
+        // xterm modifier/resource controls (e.g. CSI > 4 m); accept and ignore.
     } else if (f == 's') {
         term->saved_row = term->cursor_row;
         term->saved_col = term->cursor_col;
@@ -787,6 +802,18 @@ static void emit_utf8_char(terminal_t *term, uint8_t c) {
 static void parse_char(terminal_t *term, uint8_t c) {
     switch (term->state) {
     case ST_GROUND:
+        if (term->utf8_expected) {
+            // Consume UTF-8 continuation bytes before control-sequence checks.
+            // This prevents bytes like 0x9B (C1 CSI) inside multibyte glyphs
+            // (e.g. U+F15B => EF 85 9B) from being misparsed as terminal control.
+            if ((c & 0xC0) == 0x80) {
+                emit_utf8_char(term, c);
+                break;
+            }
+            term->utf8_expected = 0;
+            term->utf8_seen = 0;
+            term->utf8_codepoint = 0;
+        }
         if (c == 0x1B) {
             term->utf8_expected = 0;
             term->utf8_seen = 0;
@@ -908,7 +935,10 @@ static void parse_char(terminal_t *term, uint8_t c) {
         break;
 
     case ST_CSI:
-        if (c == '?') {
+        if (c == '[') {
+            // Tolerate malformed/redundant "CSI [" after 8-bit CSI (0x9B).
+            // Some peers emit UTF-8 C1 CSI (C2 9B) followed by '['.
+        } else if (c == '?') {
             term->question_mark = true;
         } else if (c == '>') {
             term->greater_than = true;
@@ -1007,6 +1037,7 @@ static void draw_cell_glyph(const terminal_t *term,
                             uint32_t code,
                             uint16_t color,
                             uint16_t surface_bg) {
+    if (code == 0x2328) code = 0xF11C;
     if (code == 0xE348) code = 0xF15B;
     if (code == 0xF426) code = 0xF15B;
     if (code == 0xF0B37) code = 0xF15B;
@@ -1024,7 +1055,7 @@ static void draw_cell_glyph(const terminal_t *term,
         canvas[y * stride + x] = px;
     };
 
-    if (term->bitmap_font) {
+    if (term->bitmap_font && !is_private_use_codepoint(code)) {
         const cozette_bdf_glyph_t *bg = cozette_bdf_lookup(term->bitmap_font, code);
         if (bg && bg->box_w > 0 && bg->box_h > 0) {
             int bytes_per_row = (bg->box_w + 7) / 8;

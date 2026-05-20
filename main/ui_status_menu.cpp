@@ -287,19 +287,19 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     lv_label_set_text(s_icon_batt, LV_SYMBOL_BATTERY_FULL);
     lv_obj_set_style_text_font(s_icon_batt, lv_font_get_default(), 0);
     lv_obj_set_style_text_color(s_icon_batt, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_icon_batt, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_align(s_icon_batt, LV_ALIGN_TOP_RIGHT, -2, 52);
 
     s_icon_ble = lv_label_create(s_collapsed);
     lv_label_set_text(s_icon_ble, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_font(s_icon_ble, lv_font_get_default(), 0);
     lv_obj_set_style_text_color(s_icon_ble, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_icon_ble, LV_ALIGN_TOP_MID, 0, 72);
+    lv_obj_align(s_icon_ble, LV_ALIGN_TOP_MID, 0, 30);
 
     s_icon_wifi = lv_label_create(s_collapsed);
     lv_label_set_text(s_icon_wifi, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_font(s_icon_wifi, lv_font_get_default(), 0);
     lv_obj_set_style_text_color(s_icon_wifi, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_icon_wifi, LV_ALIGN_TOP_MID, 0, 48);
+    lv_obj_align(s_icon_wifi, LV_ALIGN_TOP_MID, 0, 8);
 
     s_expanded = lv_obj_create(s_menu);
     lv_obj_set_size(s_expanded, EXPANDED_W, SCREEN_H);
