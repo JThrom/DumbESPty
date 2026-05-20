@@ -66,20 +66,26 @@ static size_t filter_and_reply_fast_queries(const char *src, size_t len, char *d
         if (i + 4 <= len &&
             (uint8_t)src[i] == 0x1B && src[i + 1] == '[' && src[i + 2] == '5' && src[i + 3] == 'n') {
             if (ssh_connected && channel) {
-                ESP_LOGI(TAG, "Fast DSR reply: CSI 5n -> 0n");
-                ssh_write("\033[0n", 4);
+                int wr = ssh_write("\033[0n", 4);
+                if (wr == 4) {
+                    ESP_LOGI(TAG, "Fast DSR reply: CSI 5n -> 0n");
+                    i += 4;
+                    continue;
+                }
+                ESP_LOGW(TAG, "Fast DSR reply failed for CSI 5n (wr=%d), falling back", wr);
             }
-            i += 4;
-            continue;
         }
         if (i + 5 <= len &&
             (uint8_t)src[i] == 0x1B && src[i + 1] == '[' && src[i + 2] == '?' && src[i + 3] == '5' && src[i + 4] == 'n') {
             if (ssh_connected && channel) {
-                ESP_LOGI(TAG, "Fast DSR reply: CSI ?5n -> ?0n");
-                ssh_write("\033[?0n", 5);
+                int wr = ssh_write("\033[?0n", 5);
+                if (wr == 5) {
+                    ESP_LOGI(TAG, "Fast DSR reply: CSI ?5n -> ?0n");
+                    i += 5;
+                    continue;
+                }
+                ESP_LOGW(TAG, "Fast DSR reply failed for CSI ?5n (wr=%d), falling back", wr);
             }
-            i += 5;
-            continue;
         }
         if (o < SSH_RX_BUF_SIZE - 1) dst[o++] = src[i];
         i++;
@@ -503,6 +509,11 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         coex_release();
         return false;
     }
+
+    // Keep channel non-blocking during PTY/shell startup so timeout wrappers
+    // can handle EAGAIN instead of blocking inside libssh2 internals.
+    libssh2_channel_set_blocking(channel, 0);
+
     ESP_LOGI(TAG, "Channel open OK, requesting PTY...");
 
     rc = ssh_channel_request_pty_with_timeout(channel, "xterm-256color", SSH_HANDSHAKE_TIMEOUT_MS);
@@ -542,7 +553,6 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         return false;
     }
 
-    libssh2_channel_set_blocking(channel, 0);
     ssh_connected = true;
     s_rx_trace_budget = 160;
     s_rx_prev_tail = 0;

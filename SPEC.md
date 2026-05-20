@@ -55,10 +55,13 @@ Compatibility implemented for active editor/shell scenarios:
 - `CSI ?u` handled distinctly from restore-cursor `CSI u`
 - Keypad mode escapes `ESC >` / `ESC =` consumed correctly
 - `CSI X` (Erase Character) implemented
+- `CSI d` (VPA: vertical position absolute) implemented
 - `CSI > ... q` and `CSI > ... u` variants consumed to reduce compatibility warning noise
+- UTF-8 continuation bytes are consumed before C1 checks in ground state, preventing icon bytes (for example `U+F15B` -> `EF 85 9B`) from being misparsed as CSI
 
 Rendering notes:
 - Uses Cozette bitmap font with LVGL fallback font path
+- Private-use codepoints (Nerd icon ranges) skip Cozette bitmap lookup so Nerd symbol glyphs render consistently
 - Fixed grid target currently tuned for compact editor use (`100x32`, `8x15`)
 - Icon fallback remaps currently include `U+F426`, `U+E348`, `U+F0B37`, `U+F12B7`, and `U+F1064` to `U+F15B`
 
@@ -149,6 +152,31 @@ Observed warning:
 Status:
 - Requests/replies have been observed in logs.
 - Root cause is likely sequence timing/ordering or related capability probing.
+
+Investigation log (2026-05):
+- Baseline behavior:
+  - LazyVim main screen renders with current stable parser baseline.
+  - Warning still appears at startup: `Did not detect DSR response from terminal`.
+- Implemented/validated paths:
+  - Parser-side DSR handling in `terminal.cpp` replies to:
+    - `CSI 5n` -> `CSI 0n`
+    - `CSI ?5n` -> `CSI ?0n`
+    - `CSI 6n` / `CSI ?6n` -> CPR (`CSI row;colR` variants)
+  - SSH RX fast path in `ssh_client.cpp` currently handles `CSI 5n` and `CSI ?5n`.
+- Experiments attempted during this cycle:
+  - Added additional SSH-side fast handling/probing for DSR/CPR-related startup queries.
+  - Added XTGETTCAP/OSC/DA response experiments to satisfy Neovim startup probing.
+  - Added passive RX tracing for sequence ordering.
+- Outcomes and regressions observed:
+  - DSR warning persisted through those experiments.
+  - Aggressive SSH receive-path interception caused instability (`task_wdt` on `ssh_recv` via lwIP mutex path) and/or partial rendering regressions.
+  - Experimental scanner/intercept logic was rolled back to preserve known-good rendering stability.
+- Additional host-side test result:
+  - `nvim --clean` was tested with both `TERM=xterm` and `TERM=xterm-256color`.
+  - DSR warning appeared in both cases.
+- Current disposition:
+  - DSR issue is documented and intentionally paused.
+  - Keep stable baseline and avoid further risky SSH RX interception until resumed.
 
 Planned next steps:
 1. collect startup trace with current stable parser baseline
