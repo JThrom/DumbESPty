@@ -50,6 +50,20 @@ Primary integration goal in the current phase: keep LazyVim rendering stable whi
 - Glyph fallback remaps expanded for observed Nerd Font gaps.
 - Private-use icon codepoints (Nerd Font ranges) now bypass Cozette bitmap lookup so Nerd symbols are preferred.
 
+## Recent SSH/Tailnet Stabilization (2026-05)
+
+- SSH handshake/auth path was repaired for ESP-IDF 6.1 + mbedTLS v3 by fixing libssh2 mbedTLS backend issues:
+  - corrected cipher direction selection,
+  - corrected HMAC setup flow for mbedTLS v3.
+- Strict-KEX behavior was corrected by removing unilateral strict-mode activation from server-only KEX tokens, preventing sequence reset mismatches after NEWKEYS.
+- SSH startup/rendering reliability improved:
+  - if background `ssh_recv` task creation fails, RX now falls back to foreground pump in main loop,
+  - remote shell output still renders on display under constrained memory/task conditions.
+- SSH debug trace verbosity is now reduced by default (`SSH_VERBOSE_LOGS=0`).
+- DERP/WireGuard periodic log chatter was reduced for cleaner monitor output:
+  - DERP reconnect/connect failures are warnings (with errno text),
+  - periodic WG/disco timing logs only print on slow runs.
+
 ## Status Menu and BLE Usage
 
 1. Open the status menu from the top status strip touch area.

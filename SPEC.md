@@ -69,7 +69,7 @@ Rendering notes:
 
 Responsibilities:
 - Opens TCP + libssh2 session/channel
-- Receives remote stream in dedicated task
+- Receives remote stream in dedicated task when available
 - Queues RX messages for main-loop processing
 - Provides outbound write path for shell/keyboard input
 
@@ -77,7 +77,12 @@ Stability hardening:
 - RX queue creation fallback depths: `128, 96, 64, 48, 32, 24`
 - `ssh_write_mutex` serializes concurrent writes
 - Fast DSR query filter/reply path for `CSI 5n` and `CSI ?5n`
-- Optional RX trace logging for terminal compatibility debugging
+- Foreground RX pump fallback in main loop when `ssh_recv` task creation fails
+- Optional RX/libssh2 trace logging for terminal compatibility debugging (disabled by default in normal operation)
+- libssh2/mbedTLS compatibility fixes for ESP-IDF 6.1:
+  - corrected cipher direction handling,
+  - corrected mbedTLS v3 HMAC setup flow
+- strict-KEX handling corrected to avoid unilateral sequence resets after NEWKEYS
 
 ### Shell (`main/shell.cpp`, `main/shell.hpp`)
 
@@ -143,6 +148,20 @@ idf.py -p /dev/ttyACM1 flash
 ```
 
 ## Current Bug Worklist
+
+### 0) SSH handshake/auth regression (resolved in this cycle)
+
+Previously observed:
+- handshake stalled/failure after NEWKEYS while waiting for `SERVICE_ACCEPT`
+- errors such as `Failed to get response to ssh-userauth request` and immediate server FIN after first encrypted userauth packet
+
+Resolution summary:
+- fixed libssh2 mbedTLS crypto/HMAC backend issues,
+- removed unilateral strict-KEX enable paths that reset sequence numbers incorrectly,
+- validated successful remote shell bring-up (tmux/nvim launching).
+
+Current status:
+- resolved for current baseline.
 
 ### 1) Neovim DSR warning
 

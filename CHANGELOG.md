@@ -4,6 +4,32 @@ All notable changes to DumbESPty are documented in this file.
 
 ## [Unreleased]
 
+### Added (UI/Terminal)
+- Local credential/system managers and shell integration modules:
+  - `hostname_mgr`
+  - `secret_vault`
+  - `tailscale_mgr`
+- SSH foreground RX pump fallback when background `ssh_recv` task cannot be created, so remote shell rendering still works on constrained heap/task conditions.
+- Focused SSH/transport diagnostics used for handshake bring-up and packet flow verification.
+
+### Changed (UI/Terminal)
+- SSH/libssh2 handshake compatibility for ESP-IDF 6.1 + mbedTLS v3:
+  - fixed cipher encrypt/decrypt direction in libssh2 mbedTLS backend,
+  - fixed HMAC init path for mbedTLS v3 (`mbedtls_md_hmac_setup` flow),
+  - retained stable cipher-context reset behavior.
+- Removed unilateral strict-KEX activation paths that were resetting packet sequence numbers and causing server disconnect after first encrypted userauth packet.
+- SSH logging defaults reduced:
+  - libssh2 trace spam disabled by default (`SSH_VERBOSE_LOGS=0`),
+  - high-frequency RX queue/read debug output removed from normal logs.
+- DERP and WireGuard manager log verbosity tuned for normal operation:
+  - DERP TCP reconnect failures reported as warnings with errno text,
+  - periodic WG/disco timing logs now only emit when slow.
+
+### Fixed (UI/Terminal)
+- SSH handshake no longer fails at `Failed to get response to ssh-userauth request` after NEWKEYS due to strict-KEX sequence handling mismatch.
+- Restored interactive remote shell rendering on-device even when `ssh_recv` task allocation fails.
+- Eliminated immediate post-connect server FIN pattern caused by malformed/sequence-misaligned first encrypted userauth packet path.
+
 ### Added
 - Touch status menu module with expanded drawer UI, outside-tap dismiss, and updated hit zones.
 - BLE keyboard management UI flow:

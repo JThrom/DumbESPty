@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include <cstring>
@@ -21,11 +22,13 @@
 
 static const char *TAG = "SSH_CLIENT";
 
-#define SSH_RX_QUEUE_SIZE 128
+#define SSH_RX_QUEUE_SIZE 64
 #define SSH_RX_BUF_SIZE 256
 #define SSH_HANDSHAKE_TIMEOUT_MS 45000
 #define SSH_CONNECT_TIMEOUT_MS 5000
 #define SSH_CONNECT_RETRIES 3
+#define SSH_HANDSHAKE_RETRIES 3
+#define SSH_VERBOSE_LOGS 0
 
 typedef struct {
     char data[SSH_RX_BUF_SIZE];
@@ -37,14 +40,136 @@ static int ssh_sock = -1;
 static LIBSSH2_SESSION *session = NULL;
 static LIBSSH2_CHANNEL *channel = NULL;
 static QueueHandle_t ssh_rx_queue = NULL;
+static StaticQueue_t *ssh_rx_queue_static_obj = NULL;
+static uint8_t *ssh_rx_queue_static_storage = NULL;
 static TaskHandle_t ssh_recv_task_handle = NULL;
 static terminal_t *ssh_term = NULL;
 static SemaphoreHandle_t ssh_write_mutex = NULL;
 static int s_rx_trace_budget = 160;
 static uint8_t s_rx_prev_tail = 0;
+static int s_rx_loop_budget = 120;
+static int s_queue_drain_budget = 80;
+
+static size_t filter_and_reply_fast_queries(const char *src, size_t len, char *dst);
+static void log_rx_trace(const char *data, size_t len);
+
+static void ssh_handle_rx_bytes(const char *src, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        ssh_rx_msg_t msg;
+        size_t chunk = len - offset;
+        if (chunk > SSH_RX_BUF_SIZE - 1) chunk = SSH_RX_BUF_SIZE - 1;
+        msg.len = filter_and_reply_fast_queries(src + offset, chunk, msg.data);
+        log_rx_trace(msg.data, msg.len);
+        if (msg.len > 0) {
+            if (xQueueSend(ssh_rx_queue, &msg, pdMS_TO_TICKS(20)) != pdTRUE &&
+                s_rx_loop_budget > 0) {
+                ESP_LOGW(TAG, "SSH rx queue full, dropping %u bytes", (unsigned)msg.len);
+                s_rx_loop_budget--;
+            }
+        }
+        offset += chunk;
+    }
+}
+
+static void ssh_pump_rx_once(int max_reads) {
+    if (!ssh_connected || !channel || !ssh_rx_queue) return;
+
+    char buf[1024];
+    for (int i = 0; i < max_reads; i++) {
+        int rc = libssh2_channel_read(channel, buf, sizeof(buf) - 1);
+        if (rc > 0) {
+            if (s_rx_loop_budget > 0) s_rx_loop_budget--;
+            buf[rc] = '\0';
+            ssh_handle_rx_bytes(buf, (size_t)rc);
+            continue;
+        }
+
+        if (rc == LIBSSH2_ERROR_EAGAIN || rc == 0) {
+            break;
+        }
+
+        ESP_LOGW(TAG, "SSH rx read error: rc=%d", rc);
+        ssh_connected = false;
+        break;
+    }
+
+    if (libssh2_channel_eof(channel)) {
+        ssh_connected = false;
+    }
+}
+
+#if SSH_VERBOSE_LOGS
+static int s_ssh_trace_budget = 1200;
+
+static void ssh_trace_handler(LIBSSH2_SESSION *session, void *context,
+                              const char *data, size_t len) {
+    (void)session;
+    (void)context;
+    if (!data || len == 0 || s_ssh_trace_budget <= 0) return;
+
+    size_t take = len;
+    if (take > 180) take = 180;
+    char line[192];
+    memcpy(line, data, take);
+    line[take] = '\0';
+    ESP_LOGI(TAG, "libssh2: %s", line);
+    s_ssh_trace_budget--;
+}
+
+static void log_supported_algs(LIBSSH2_SESSION *sess, int method_type, const char *label) {
+    const char **algs = NULL;
+    int n = libssh2_session_supported_algs(sess, method_type, &algs);
+    if (n < 0 || !algs) {
+        ESP_LOGW(TAG, "supported_algs(%s) unavailable: %d", label, n);
+        return;
+    }
+
+    char buf[320];
+    int p = snprintf(buf, sizeof(buf), "%s:", label);
+    for (int i = 0; i < n; i++) {
+        p += snprintf(buf + p, sizeof(buf) - p, "%s%s", (i == 0 ? " " : ","), algs[i]);
+        if (p >= (int)sizeof(buf) - 32) break;
+    }
+    ESP_LOGI(TAG, "%s", buf);
+    libssh2_free(sess, (void *)algs);
+}
+#endif
 
 static QueueHandle_t create_rx_queue_with_fallback(void) {
-    static const uint16_t depth_candidates[] = {SSH_RX_QUEUE_SIZE, 96, 64, 48, 32, 24};
+    size_t static_bytes = SSH_RX_QUEUE_SIZE * sizeof(ssh_rx_msg_t);
+    ssh_rx_queue_static_storage = (uint8_t *)heap_caps_malloc(static_bytes,
+                                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ssh_rx_queue_static_storage) {
+        ssh_rx_queue_static_obj = (StaticQueue_t *)heap_caps_malloc(sizeof(StaticQueue_t),
+                                                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (ssh_rx_queue_static_obj) {
+            QueueHandle_t static_q = xQueueCreateStatic(SSH_RX_QUEUE_SIZE,
+                                                        sizeof(ssh_rx_msg_t),
+                                                        ssh_rx_queue_static_storage,
+                                                        ssh_rx_queue_static_obj);
+            if (static_q) {
+                ESP_LOGI(TAG,
+                         "RX queue created (static+SPIRAM): depth=%u item=%u (~%u bytes payload)",
+                         (unsigned)SSH_RX_QUEUE_SIZE,
+                         (unsigned)sizeof(ssh_rx_msg_t),
+                         (unsigned)static_bytes);
+                return static_q;
+            }
+            free(ssh_rx_queue_static_obj);
+            ssh_rx_queue_static_obj = NULL;
+        }
+        free(ssh_rx_queue_static_storage);
+        ssh_rx_queue_static_storage = NULL;
+    }
+
+    ESP_LOGW(TAG,
+             "Static RX queue unavailable; trying dynamic fallback (free_int=%u largest_int=%u free_spiram=%u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    static const uint16_t depth_candidates[] = {48, 32, 24, 16};
     for (size_t i = 0; i < sizeof(depth_candidates) / sizeof(depth_candidates[0]); i++) {
         uint16_t depth = depth_candidates[i];
         QueueHandle_t q = xQueueCreate(depth, sizeof(ssh_rx_msg_t));
@@ -157,6 +282,14 @@ static void delete_rx_queue(void) {
         vQueueDelete(ssh_rx_queue);
         ssh_rx_queue = NULL;
     }
+    if (ssh_rx_queue_static_obj) {
+        free(ssh_rx_queue_static_obj);
+        ssh_rx_queue_static_obj = NULL;
+    }
+    if (ssh_rx_queue_static_storage) {
+        free(ssh_rx_queue_static_storage);
+        ssh_rx_queue_static_storage = NULL;
+    }
 }
 
 static int waitsocket(int sock, LIBSSH2_SESSION *sess);
@@ -183,6 +316,7 @@ static int ssh_handshake_with_timeout(int timeout_ms) {
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
+        ESP_LOGE(TAG, "session_handshake rc=%d last_errno=%d", rc, libssh2_session_last_errno(session));
         return rc;
     }
     return LIBSSH2_ERROR_TIMEOUT;
@@ -273,6 +407,17 @@ static bool ssh_probe_banner_with_timeout(char *dst, size_t dst_len, int timeout
     return false;
 }
 
+static bool set_socket_blocking_mode(int fd, bool blocking) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return false;
+    if (blocking) {
+        flags &= ~O_NONBLOCK;
+    } else {
+        flags |= O_NONBLOCK;
+    }
+    return fcntl(fd, F_SETFL, flags) == 0;
+}
+
 static bool tcp_connect_with_retry(const struct sockaddr_in *saddr) {
     for (int attempt = 1; attempt <= SSH_CONNECT_RETRIES; attempt++) {
         ssh_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -337,13 +482,16 @@ static int waitsocket(int sock, LIBSSH2_SESSION *sess) {
     struct fd_set rfds;
     struct fd_set wfds;
     struct timeval timeout;
-
-    (void)sess;
+    int dir = sess ? libssh2_session_block_directions(sess) : 0;
 
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
-    FD_SET(sock, &rfds);
-    FD_SET(sock, &wfds);
+    if (dir == 0 || (dir & LIBSSH2_SESSION_BLOCK_INBOUND)) {
+        FD_SET(sock, &rfds);
+    }
+    if (dir == 0 || (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)) {
+        FD_SET(sock, &wfds);
+    }
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
 
@@ -352,28 +500,20 @@ static int waitsocket(int sock, LIBSSH2_SESSION *sess) {
 
 static void ssh_recv_task(void *param) {
     char buf[1024];
+    ESP_LOGD(TAG, "SSH recv task started");
 
     while (ssh_connected && channel) {
         int rc = libssh2_channel_read(channel, buf, sizeof(buf) - 1);
 
         if (rc > 0) {
+            if (s_rx_loop_budget > 0) s_rx_loop_budget--;
             buf[rc] = '\0';
-            size_t offset = 0;
-            while (offset < (size_t)rc) {
-                ssh_rx_msg_t msg;
-                size_t chunk = rc - offset;
-                if (chunk > SSH_RX_BUF_SIZE - 1) chunk = SSH_RX_BUF_SIZE - 1;
-                msg.len = filter_and_reply_fast_queries(buf + offset, chunk, msg.data);
-                log_rx_trace(msg.data, msg.len);
-                if (msg.len > 0) {
-                    xQueueSend(ssh_rx_queue, &msg, pdMS_TO_TICKS(20));
-                }
-                offset += chunk;
-            }
-        } else if (rc == LIBSSH2_ERROR_EAGAIN) {
+            ssh_handle_rx_bytes(buf, (size_t)rc);
+        } else if (rc == LIBSSH2_ERROR_EAGAIN || rc == 0) {
             waitsocket(ssh_sock, session);
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(10));
         } else {
+            ESP_LOGW(TAG, "SSH rx read error: rc=%d", rc);
             break;
         }
 
@@ -447,41 +587,111 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         ESP_LOGI(TAG, "SSH banner probe (%d bytes): %.80s", (int)strlen(banner_probe), banner_probe);
     }
 
+    /* Use blocking socket during key exchange/auth for stability on ESP32. */
+    if (!set_socket_blocking_mode(ssh_sock, true)) {
+        ESP_LOGW(TAG, "Failed to switch SSH socket to blocking mode");
+    }
+
     { // libssh2 scope
-    int rc = libssh2_init(0);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "libssh2 init failed: %d", rc);
-        close(ssh_sock); ssh_sock = -1;
-        delete_rx_queue();
-        coex_release();
-        return false;
-    }
+    int rc = 0;
+    for (int hs_try = 1; hs_try <= SSH_HANDSHAKE_RETRIES; hs_try++) {
+        rc = libssh2_init(0);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "libssh2 init failed: %d", rc);
+            close(ssh_sock); ssh_sock = -1;
+            delete_rx_queue();
+            coex_release();
+            return false;
+        }
 
-    session = libssh2_session_init();
-    if (!session) {
-        ESP_LOGE(TAG, "Session init failed");
-        libssh2_exit();
-        close(ssh_sock); ssh_sock = -1;
-        delete_rx_queue();
-        coex_release();
-        return false;
-    }
+        session = libssh2_session_init();
+        if (!session) {
+            ESP_LOGE(TAG, "Session init failed");
+            libssh2_exit();
+            close(ssh_sock); ssh_sock = -1;
+            delete_rx_queue();
+            coex_release();
+            return false;
+        }
 
-    libssh2_session_set_blocking(session, 0);
-    libssh2_session_set_timeout(session, SSH_HANDSHAKE_TIMEOUT_MS);
+#if SSH_VERBOSE_LOGS
+        s_ssh_trace_budget = 1200;
+        libssh2_trace_sethandler(session, NULL, ssh_trace_handler);
+        libssh2_trace(session, LIBSSH2_TRACE_KEX |
+                               LIBSSH2_TRACE_AUTH |
+                               LIBSSH2_TRACE_TRANS |
+                               LIBSSH2_TRACE_SOCKET |
+                               LIBSSH2_TRACE_ERROR);
+#else
+        libssh2_trace(session, 0);
+#endif
 
-    ESP_LOGI(TAG, "Starting SSH handshake...");
-    rc = ssh_handshake_with_timeout(SSH_HANDSHAKE_TIMEOUT_MS);
-    if (rc != 0) {
+        /* Prefer conservative algorithms on ESP32 to avoid intermittent
+         * failures seen with chacha20-poly1305 in some libssh2/mbedTLS mixes. */
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_CS,
+                                    "aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr");
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_SC,
+                                    "aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr");
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_CS,
+                                    "hmac-sha1,hmac-sha2-256,hmac-sha2-512");
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_SC,
+                                    "hmac-sha1,hmac-sha2-256,hmac-sha2-512");
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_KEX,
+                                    "ecdh-sha2-nistp256,diffie-hellman-group14-sha256");
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY,
+                                    "ecdsa-sha2-nistp256,ssh-ed25519");
+
+#if SSH_VERBOSE_LOGS
+        log_supported_algs(session, LIBSSH2_METHOD_KEX, "local KEX");
+        log_supported_algs(session, LIBSSH2_METHOD_HOSTKEY, "local hostkey");
+        log_supported_algs(session, LIBSSH2_METHOD_CRYPT_CS, "local c2s ciphers");
+        log_supported_algs(session, LIBSSH2_METHOD_MAC_CS, "local c2s mac");
+#endif
+
+        ESP_LOGI(TAG, "Using libssh2 default method negotiation");
+
+        libssh2_session_set_blocking(session, 1);
+        libssh2_session_set_timeout(session, SSH_HANDSHAKE_TIMEOUT_MS);
+
+        ESP_LOGI(TAG, "Starting SSH handshake (attempt %d/%d)...", hs_try, SSH_HANDSHAKE_RETRIES);
+        rc = ssh_handshake_with_timeout(SSH_HANDSHAKE_TIMEOUT_MS);
+        if (rc == 0) {
+            break;
+        }
+
         log_session_error("Handshake");
         ESP_LOGE(TAG, "Handshake failed: rc=%d errno=%d %s", rc, errno, strerror(errno));
-        libssh2_session_free(session); session = NULL;
+
+        libssh2_session_free(session);
+        session = NULL;
         libssh2_exit();
-        close(ssh_sock); ssh_sock = -1;
+        close(ssh_sock);
+        ssh_sock = -1;
+
+        if (hs_try >= SSH_HANDSHAKE_RETRIES) {
+            delete_rx_queue();
+            coex_release();
+            return false;
+        }
+
+        ESP_LOGW(TAG, "Retrying after handshake failure rc=%d", rc);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        if (!tcp_connect_with_retry(&saddr)) {
+            ESP_LOGE(TAG, "TCP reconnect failed after handshake error");
+            delete_rx_queue();
+            coex_release();
+            return false;
+        }
+        int keepalive_retry = 1;
+        setsockopt(ssh_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive_retry, sizeof(keepalive_retry));
+    }
+
+    if (rc != 0 || !session) {
         delete_rx_queue();
         coex_release();
         return false;
     }
+
     ESP_LOGI(TAG, "Handshake OK, authenticating...");
 
     rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
@@ -556,8 +766,35 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     ssh_connected = true;
     s_rx_trace_budget = 160;
     s_rx_prev_tail = 0;
+    s_rx_loop_budget = 120;
+    s_queue_drain_budget = 80;
 
-    xTaskCreate(ssh_recv_task, "ssh_recv", 8192, NULL, 5, &ssh_recv_task_handle);
+    /* Return to non-blocking mode for interactive operation loops. */
+    if (!set_socket_blocking_mode(ssh_sock, false)) {
+        ESP_LOGW(TAG, "Failed to restore SSH socket non-blocking mode");
+    }
+    libssh2_session_set_blocking(session, 0);
+
+    ESP_LOGD(TAG, "Starting SSH recv task...");
+    BaseType_t rx_task_ok = xTaskCreatePinnedToCore(ssh_recv_task,
+                                                    "ssh_recv",
+                                                    8192,
+                                                    NULL,
+                                                    5,
+                                                    &ssh_recv_task_handle,
+                                                    0);
+    if (rx_task_ok != pdPASS) {
+        rx_task_ok = xTaskCreate(ssh_recv_task,
+                                 "ssh_recv",
+                                 8192,
+                                 NULL,
+                                 5,
+                                 &ssh_recv_task_handle);
+    }
+    if (rx_task_ok != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create ssh_recv task, using foreground RX pump");
+        ssh_recv_task_handle = NULL;
+    }
     coex_release();
 
     ESP_LOGI(TAG, "SSH connected to %s:%d as %s", host, port, user);
@@ -593,6 +830,7 @@ void ssh_disconnect(void) {
         vSemaphoreDelete(ssh_write_mutex);
         ssh_write_mutex = NULL;
     }
+    delete_rx_queue();
     libssh2_exit();
 
     coex_release();
@@ -634,21 +872,26 @@ int ssh_write(const char *data, int len) {
 void ssh_process_queue(void) {
     if (!ssh_rx_queue) return;
 
+    if (ssh_connected && channel && !ssh_recv_task_handle) {
+        ssh_pump_rx_once(4);
+    }
+
     ssh_rx_msg_t msg;
+    int drained = 0;
     while (xQueueReceive(ssh_rx_queue, &msg, 0) == pdTRUE) {
+        drained++;
         if (ssh_term) {
             terminal_write(ssh_term, msg.data, msg.len);
         }
     }
 
+    if (drained > 0 && s_queue_drain_budget > 0) s_queue_drain_budget--;
+
     if (!ssh_connected) {
         if (channel || session || ssh_sock >= 0) {
             ssh_disconnect();
         }
-        if (ssh_rx_queue) {
-            vQueueDelete(ssh_rx_queue);
-            ssh_rx_queue = NULL;
-        }
+        delete_rx_queue();
         if (shell_is_ssh_active()) {
             shell_set_ssh_active(false);
         }

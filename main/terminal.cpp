@@ -1043,6 +1043,7 @@ static void draw_cell_glyph(const terminal_t *term,
     if (code == 0xF0B37) code = 0xF15B;
     if (code == 0xF12B7) code = 0xF15B;
     if (code == 0xF1064) code = 0xF15B;
+    if (code == 0x2750) code = '*';
     if (code < 0x20) return;
 
     uint16_t fg = compensate_text_color(color, surface_bg);

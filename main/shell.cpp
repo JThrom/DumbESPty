@@ -1,16 +1,20 @@
 #include "shell.hpp"
+#include "hostname_mgr.hpp"
+#include "secret_vault.hpp"
 #include "ssh_client.hpp"
+#include "tailscale_mgr.hpp"
 #include "terminal.hpp"
 #include <cstring>
 #include <cstdio>
 #include "wifi_mgr.hpp"
-#include "ssh_client.hpp"
 #include <cstdlib>
 #include "esp_log.h"
 #include "esp_app_desc.h"
 #include "esp_idf_version.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "lvgl.h"
 #include "libssh2.h"
 
@@ -46,9 +50,115 @@ static bool ssh_connect_pending = false;
 static bool suppress_prompt_once = false;
 static bool input_masked = false;
 
+static bool completion_active = false;
+static int completion_count = 0;
+static int completion_index = 0;
+static int completion_token_start = 0;
+static int completion_token_len = 0;
+static char completion_items[16][33];
+
 extern void cmd_help(int argc, char **argv);
 extern void cmd_wifi(int argc, char **argv);
 extern void cmd_ssh(int argc, char **argv);
+extern void cmd_tailscale(int argc, char **argv);
+extern void cmd_hostname(int argc, char **argv);
+
+static void completion_reset(void) {
+    completion_active = false;
+    completion_count = 0;
+    completion_index = 0;
+    completion_token_start = 0;
+    completion_token_len = 0;
+}
+
+static void redraw_input_line(void) {
+    char spaces[INPUT_BUF_SIZE + 1];
+    memset(spaces, ' ', sizeof(spaces) - 1);
+    spaces[sizeof(spaces) - 1] = '\0';
+    terminal_write(term, "\r$ ", 3);
+    terminal_write(term, spaces, input_len);
+    terminal_write(term, "\r$ ", 3);
+    terminal_write(term, input_buf, input_len);
+}
+
+static int completion_collect_wifi_connect(char out[][33], int max_entries, const char *prefix) {
+    for (int i = 0; i < max_entries; i++) out[i][0] = '\0';
+    char ssids[16][33];
+    const int count = wifi_mgr_get_saved_ssids(ssids, 16);
+    int n = 0;
+    for (int i = 0; i < count && n < max_entries; i++) {
+        if (!prefix || !prefix[0] || strncmp(ssids[i], prefix, strlen(prefix)) == 0) {
+            const size_t nlen = strnlen(ssids[i], 32);
+            memcpy(out[n], ssids[i], nlen);
+            out[n][nlen] = '\0';
+            n++;
+        }
+    }
+    return n;
+}
+
+static bool completion_try_begin(void) {
+    char line[INPUT_BUF_SIZE];
+    snprintf(line, sizeof(line), "%s", input_buf);
+
+    const char *prefix_cmd = "wifi connect";
+    const size_t prefix_len = strlen(prefix_cmd);
+    if (strncmp(line, prefix_cmd, prefix_len) != 0) return false;
+    if (line[prefix_len] != '\0' && line[prefix_len] != ' ') return false;
+
+    if (line[prefix_len] == '\0') {
+        if (input_len < INPUT_BUF_SIZE - 1) {
+            input_buf[input_len++] = ' ';
+            input_buf[input_len] = '\0';
+            input_cursor = input_len;
+            snprintf(line, sizeof(line), "%s", input_buf);
+        } else {
+            return false;
+        }
+    }
+
+    completion_token_start = (int)prefix_len + 1;
+    completion_token_len = input_len - completion_token_start;
+    if (completion_token_len < 0) completion_token_len = 0;
+
+    char token_buf[33];
+    if (completion_token_len > 32) return false;
+    memcpy(token_buf, input_buf + completion_token_start, completion_token_len);
+    token_buf[completion_token_len] = '\0';
+
+    completion_count = completion_collect_wifi_connect(completion_items, 16, token_buf);
+    if (completion_count <= 0) return false;
+    completion_index = 0;
+    completion_active = completion_count > 1;
+    return true;
+}
+
+static void completion_apply_current(void) {
+    if (completion_count <= 0) return;
+    const char *choice = completion_items[completion_index];
+    const int choice_len = strlen(choice);
+    const int before_len = completion_token_start;
+    const bool need_space = (choice_len + before_len + 1) < INPUT_BUF_SIZE;
+
+    int new_len = before_len + choice_len;
+    memcpy(input_buf + completion_token_start, choice, choice_len);
+    if (need_space) input_buf[new_len++] = ' ';
+    input_buf[new_len] = '\0';
+    input_len = new_len;
+    input_cursor = new_len;
+    redraw_input_line();
+}
+
+static void completion_print_choices(void) {
+    if (completion_count <= 1) return;
+    for (int i = 0; i < completion_count; i++) {
+        shell_print("\r\n    ");
+        shell_print(i == completion_index ? "> " : "  ");
+        shell_print(completion_items[i]);
+    }
+    shell_print("\r\n");
+    redraw_input_line();
+}
 
 void shell_print(const char *text) {
     if (term) terminal_write(term, text, -1);
@@ -66,6 +176,7 @@ void shell_register_cmd(const char *name, void (*handler)(int, char **)) {
 
 void shell_get_input(void (*callback)(const char *)) {
     input_callback = callback;
+    completion_reset();
     input_masked = false;
     input_len = 0;
     input_cursor = 0;
@@ -74,6 +185,7 @@ void shell_get_input(void (*callback)(const char *)) {
 
 void shell_get_hidden_input(void (*callback)(const char *)) {
     input_callback = callback;
+    completion_reset();
     input_masked = true;
     input_len = 0;
     input_cursor = 0;
@@ -82,8 +194,7 @@ void shell_get_hidden_input(void (*callback)(const char *)) {
 
 static void execute_command(const char *line) {
     char buf[INPUT_BUF_SIZE];
-    strncpy(buf, line, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    snprintf(buf, sizeof(buf), "%s", line);
 
     char *argv[CMD_MAX_ARGS];
     int argc = 0;
@@ -128,6 +239,7 @@ static void clear_screen_and_prompt(void) {
     input_buf[0] = '\0';
     history_idx = -1;
     input_masked = false;
+    completion_reset();
 }
 
 static void prompt(bool leading_newline) {
@@ -138,6 +250,7 @@ static void prompt(bool leading_newline) {
     input_buf[0] = '\0';
     history_idx = -1;
     input_masked = false;
+    completion_reset();
 }
 
 void shell_set_ssh_active(bool active) {
@@ -173,6 +286,7 @@ void shell_handle_key(char c) {
     }
 
     if (c == '\b') {
+        completion_reset();
         if (input_cursor > 0) {
             terminal_write(term, "\b \b", 3);
             memmove(input_buf + input_cursor - 1, input_buf + input_cursor,
@@ -181,6 +295,7 @@ void shell_handle_key(char c) {
             input_cursor--;
         }
     } else if (c == 0x1B) {
+        completion_reset();
         input_callback = NULL;
         input_masked = false;
         input_len = 0;
@@ -188,6 +303,7 @@ void shell_handle_key(char c) {
         input_buf[0] = '\0';
         prompt(true);
     } else if (c == '\n' || c == '\r') {
+        completion_reset();
         input_buf[input_len] = '\0';
         terminal_write(term, "\r\n", 2);
         if (input_len > 0 || !input_callback) {
@@ -210,6 +326,12 @@ void shell_handle_key(char c) {
             else prompt(false);
         }
     } else if (c == 0x1E) {
+        if (completion_active && completion_count > 1) {
+            completion_index = (completion_index + completion_count - 1) % completion_count;
+            completion_apply_current();
+            completion_print_choices();
+            return;
+        }
         if (history_count == 0) return;
         if (history_idx == -1) {
             strcpy(history_draft, input_buf);
@@ -237,6 +359,12 @@ void shell_handle_key(char c) {
         input_len = new_len;
         input_cursor = new_len;
     } else if (c == 0x1F) {
+        if (completion_active && completion_count > 1) {
+            completion_index = (completion_index + 1) % completion_count;
+            completion_apply_current();
+            completion_print_choices();
+            return;
+        }
         if (history_idx == -1) return;
         const char *new_text;
         int new_len;
@@ -265,16 +393,27 @@ void shell_handle_key(char c) {
         input_len = new_len;
         input_cursor = new_len;
     } else if (c == 0x1C) {
+        completion_reset();
         if (input_cursor > 0) {
             terminal_write(term, "\b", 1);
             input_cursor--;
         }
     } else if (c == 0x1D) {
+        completion_reset();
         if (input_cursor < input_len) {
             terminal_write(term, "\033[C", 3);
             input_cursor++;
         }
+    } else if (c == '\t') {
+        if (input_callback) return;
+        if (!completion_try_begin()) {
+            terminal_write(term, "\a", 1);
+            return;
+        }
+        completion_apply_current();
+        if (completion_count > 1) completion_print_choices();
     } else {
+        completion_reset();
         if (input_len < INPUT_BUF_SIZE - 1) {
             char ch = c;
             if (input_callback && input_masked) {
@@ -370,18 +509,66 @@ typedef struct {
     char pass[INPUT_BUF_SIZE];
 } ssh_connect_ctx_t;
 
-static void ssh_connect_task(void *param) {
-    ssh_connect_ctx_t *ctx = (ssh_connect_ctx_t *)param;
-    bool ok = ssh_connect(ctx->host, ctx->port, ctx->user, ctx->pass);
-    if (ok) {
-        shell_set_ssh_active(true);
-    } else {
-        shell_print("\r\n  SSH connection failed");
-        if (!ssh_active) prompt(true);
+static TaskHandle_t ssh_connect_worker_handle = NULL;
+static ssh_connect_ctx_t *ssh_connect_ctx_pending = NULL;
+
+static void ssh_connect_worker_task(void *param) {
+    (void)param;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        ssh_connect_ctx_t *ctx = ssh_connect_ctx_pending;
+        ssh_connect_ctx_pending = NULL;
+        if (!ctx) {
+            ssh_connect_pending = false;
+            continue;
+        }
+
+        bool ok = ssh_connect(ctx->host, ctx->port, ctx->user, ctx->pass);
+        if (ok) {
+            shell_set_ssh_active(true);
+        } else {
+            shell_print("\r\n  SSH connection failed");
+            if (!ssh_active) prompt(true);
+        }
+        ssh_connect_pending = false;
+        free(ctx);
     }
-    ssh_connect_pending = false;
-    free(ctx);
-    vTaskDelete(NULL);
+}
+
+static bool ensure_ssh_connect_worker(void) {
+    if (ssh_connect_worker_handle) return true;
+
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        ssh_connect_worker_task,
+        "ssh_connect",
+        8192,
+        NULL,
+        5,
+        &ssh_connect_worker_handle,
+        1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ret != pdPASS) {
+        ret = xTaskCreatePinnedToCoreWithCaps(
+            ssh_connect_worker_task,
+            "ssh_connect",
+            6144,
+            NULL,
+            5,
+            &ssh_connect_worker_handle,
+            1,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (ret != pdPASS) {
+        ret = xTaskCreatePinnedToCore(ssh_connect_worker_task, "ssh_connect", 8192, NULL, 5, &ssh_connect_worker_handle, 1);
+    }
+    if (ret != pdPASS) {
+        ret = xTaskCreatePinnedToCore(ssh_connect_worker_task, "ssh_connect", 6144, NULL, 5, &ssh_connect_worker_handle, 1);
+    }
+    if (ret != pdPASS) {
+        ret = xTaskCreate(ssh_connect_worker_task, "ssh_connect", 6144, NULL, 5, &ssh_connect_worker_handle);
+    }
+    return ret == pdPASS;
 }
 
 static void ssh_password_cb(const char *pass) {
@@ -396,23 +583,37 @@ static void ssh_password_cb(const char *pass) {
         return;
     }
 
-    strncpy(ctx->host, ssh_host, sizeof(ctx->host) - 1);
-    ctx->host[sizeof(ctx->host) - 1] = '\0';
+    snprintf(ctx->host, sizeof(ctx->host), "%s", ssh_host);
     ctx->port = ssh_port;
-    strncpy(ctx->user, ssh_user, sizeof(ctx->user) - 1);
-    ctx->user[sizeof(ctx->user) - 1] = '\0';
-    strncpy(ctx->pass, pass, sizeof(ctx->pass) - 1);
-    ctx->pass[sizeof(ctx->pass) - 1] = '\0';
+    snprintf(ctx->user, sizeof(ctx->user), "%s", ssh_user);
+    snprintf(ctx->pass, sizeof(ctx->pass), "%s", pass);
 
     ssh_connect_pending = true;
     shell_print("\r\n  Connecting...");
 
-    BaseType_t ret = xTaskCreatePinnedToCore(ssh_connect_task, "ssh_connect", 12288, ctx, 5, NULL, 1);
-    if (ret != pdPASS) {
+    char mem_line[160];
+    snprintf(mem_line, sizeof(mem_line),
+             "\r\n  mem before ssh task: free8=%u free_int=%u largest_int=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    shell_print(mem_line);
+
+    if (!ensure_ssh_connect_worker()) {
         ssh_connect_pending = false;
+        snprintf(mem_line, sizeof(mem_line),
+                 "\r\n  mem after ssh worker fail: free8=%u free_int=%u largest_int=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        shell_print(mem_line);
+        shell_print("\r\n  SSH worker task create failed");
         free(ctx);
-        shell_print("\r\n  SSH connect task create failed");
+        return;
     }
+
+    ssh_connect_ctx_pending = ctx;
+    xTaskNotifyGive(ssh_connect_worker_handle);
 }
 
 static void cmd_ssh_handler(int argc, char **argv) {
@@ -447,8 +648,7 @@ static void cmd_ssh_handler(int argc, char **argv) {
         ssh_host[host_len] = '\0';
         ssh_port = atoi(colon + 1);
     } else {
-        strncpy(ssh_host, host_part, sizeof(ssh_host) - 1);
-        ssh_host[sizeof(ssh_host) - 1] = '\0';
+        snprintf(ssh_host, sizeof(ssh_host), "%s", host_part);
         ssh_port = 22;
     }
 
@@ -470,6 +670,9 @@ void shell_init(terminal_t *t) {
     shell_register_cmd("clear", cmd_clear_handler);
     shell_register_cmd("wifi", cmd_wifi);
     shell_register_cmd("ssh", cmd_ssh_handler);
+    shell_register_cmd("tailscale", cmd_tailscale);
+    shell_register_cmd("hostname", cmd_hostname);
+    shell_register_cmd("vault", cmd_vault);
     shell_register_cmd("about", cmd_about_handler);
 
     terminal_write(term, "$ ", -1);

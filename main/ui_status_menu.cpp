@@ -12,6 +12,7 @@
 #include "esp_lcd_touch_gt911.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "tailscale_mgr.hpp"
 #include "wifi_mgr.hpp"
 
 static const char *TAG = "ui_menu";
@@ -34,9 +35,11 @@ static lv_obj_t *s_expanded = NULL;
 static lv_obj_t *s_icon_batt = NULL;
 static lv_obj_t *s_icon_ble = NULL;
 static lv_obj_t *s_icon_wifi = NULL;
+static lv_obj_t *s_icon_tailscale = NULL;
 static lv_obj_t *s_status_batt = NULL;
 static lv_obj_t *s_status_ble = NULL;
 static lv_obj_t *s_status_wifi = NULL;
+static lv_obj_t *s_status_tailscale = NULL;
 static lv_obj_t *s_ble_btn_scan = NULL;
 static lv_obj_t *s_ble_btn_disconnect = NULL;
 static lv_obj_t *s_ble_btn_scan_label = NULL;
@@ -293,13 +296,19 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     lv_label_set_text(s_icon_ble, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_font(s_icon_ble, lv_font_get_default(), 0);
     lv_obj_set_style_text_color(s_icon_ble, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_icon_ble, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_align(s_icon_ble, LV_ALIGN_TOP_MID, 0, 52);
 
     s_icon_wifi = lv_label_create(s_collapsed);
     lv_label_set_text(s_icon_wifi, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_font(s_icon_wifi, lv_font_get_default(), 0);
     lv_obj_set_style_text_color(s_icon_wifi, lv_color_hex(0xE74C3C), 0);
     lv_obj_align(s_icon_wifi, LV_ALIGN_TOP_MID, 0, 8);
+
+    s_icon_tailscale = lv_label_create(s_collapsed);
+    lv_label_set_text(s_icon_tailscale, "TS");
+    lv_obj_set_style_text_font(s_icon_tailscale, lv_font_get_default(), 0);
+    lv_obj_set_style_text_color(s_icon_tailscale, lv_color_hex(0xE74C3C), 0);
+    lv_obj_align(s_icon_tailscale, LV_ALIGN_TOP_MID, 0, 30);
 
     s_expanded = lv_obj_create(s_menu);
     lv_obj_set_size(s_expanded, EXPANDED_W, SCREEN_H);
@@ -326,7 +335,12 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     s_status_ble = lv_label_create(s_expanded);
     lv_label_set_text(s_status_ble, "BLE HID: init");
     lv_obj_set_style_text_color(s_status_ble, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_ble, LV_ALIGN_TOP_LEFT, 0, 82);
+    lv_obj_align(s_status_ble, LV_ALIGN_TOP_LEFT, 0, 278);
+
+    s_status_tailscale = lv_label_create(s_expanded);
+    lv_label_set_text(s_status_tailscale, "Tailscale: init");
+    lv_obj_set_style_text_color(s_status_tailscale, lv_color_hex(0xE74C3C), 0);
+    lv_obj_align(s_status_tailscale, LV_ALIGN_TOP_LEFT, 0, 82);
 
     s_status_wifi = lv_label_create(s_expanded);
     lv_label_set_text(s_status_wifi, "WiFi: init");
@@ -335,7 +349,7 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
 
     s_ble_btn_scan = lv_button_create(s_expanded);
     lv_obj_set_size(s_ble_btn_scan, EXPANDED_W - 24, 28);
-    lv_obj_align(s_ble_btn_scan, LV_ALIGN_TOP_LEFT, 0, 110);
+    lv_obj_align(s_ble_btn_scan, LV_ALIGN_TOP_LEFT, 0, 302);
     lv_obj_set_style_bg_color(s_ble_btn_scan, lv_color_hex(0x1F3A5F), 0);
     lv_obj_set_style_bg_opa(s_ble_btn_scan, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_ble_btn_scan, 0, 0);
@@ -347,7 +361,7 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
 
     s_ble_btn_disconnect = lv_button_create(s_expanded);
     lv_obj_set_size(s_ble_btn_disconnect, EXPANDED_W - 24, 28);
-    lv_obj_align(s_ble_btn_disconnect, LV_ALIGN_TOP_LEFT, 0, 110);
+    lv_obj_align(s_ble_btn_disconnect, LV_ALIGN_TOP_LEFT, 0, 302);
     lv_obj_set_style_bg_color(s_ble_btn_disconnect, lv_color_hex(0x1F3A5F), 0);
     lv_obj_set_style_bg_opa(s_ble_btn_disconnect, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_ble_btn_disconnect, 0, 0);
@@ -359,8 +373,8 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     lv_obj_add_flag(s_ble_btn_disconnect, LV_OBJ_FLAG_HIDDEN);
 
     s_ble_list = lv_obj_create(s_expanded);
-    lv_obj_set_size(s_ble_list, EXPANDED_W - 24, SCREEN_H - 166);
-    lv_obj_align(s_ble_list, LV_ALIGN_TOP_LEFT, 0, 158);
+    lv_obj_set_size(s_ble_list, EXPANDED_W - 24, SCREEN_H - 342);
+    lv_obj_align(s_ble_list, LV_ALIGN_TOP_LEFT, 0, 336);
     lv_obj_set_style_pad_all(s_ble_list, 4, 0);
     lv_obj_set_style_radius(s_ble_list, 4, 0);
     lv_obj_set_style_border_width(s_ble_list, 1, 0);
@@ -396,15 +410,20 @@ void ui_status_menu_update(void) {
     const int ble_slot = ble_hid_get_paired_slot();
     const bool wifi_connected = wifi_mgr_is_connected();
     const bool wifi_transient = false;
+    const bool tailscale_connected = tailscale_mgr_is_connected();
+    const bool tailscale_transient = tailscale_mgr_is_connecting();
+    const bool tailscale_enabled = tailscale_mgr_is_enabled();
     const bool ble_transient = ble_scanning || ble_connecting || (ble_connected && !ble_ready);
 
     const lv_color_t ble_color = state_color(ble_connected && ble_ready, ble_transient);
     const lv_color_t wifi_color = state_color(wifi_connected, wifi_transient);
+    const lv_color_t tailscale_color = state_color(tailscale_connected, tailscale_enabled && tailscale_transient);
     const lv_color_t batt_color = lv_color_hex(0xF1C40F);
 
     lv_obj_set_style_text_color(s_icon_batt, batt_color, 0);
     lv_obj_set_style_text_color(s_icon_ble, ble_color, 0);
     lv_obj_set_style_text_color(s_icon_wifi, wifi_color, 0);
+    lv_obj_set_style_text_color(s_icon_tailscale, tailscale_color, 0);
 
     char line[128];
     if (ble_connected) {
@@ -425,6 +444,10 @@ void ui_status_menu_update(void) {
     }
     lv_label_set_text(s_status_wifi, line);
     lv_obj_set_style_text_color(s_status_wifi, wifi_color, 0);
+
+    tailscale_mgr_get_status_line(line, sizeof(line));
+    lv_label_set_text(s_status_tailscale, line);
+    lv_obj_set_style_text_color(s_status_tailscale, tailscale_color, 0);
 
     lv_label_set_text(s_status_batt, "Battery: unavailable");
     lv_obj_set_style_text_color(s_status_batt, batt_color, 0);

@@ -8,6 +8,7 @@
 static const char *TAG = "WS_DISP";
 #define W 800
 #define H 480
+#define DRAW_BUF_LINES 4
 #define PCLK_HZ 12500000  // known-good clock for this panel
 
 /* Waveshare 7" ESP32-S3 RGB GPIOs per official doc + Launcher */
@@ -113,13 +114,17 @@ esp_err_t waveshare_display_init(lv_display_t **out_disp) {
     ret = esp_lcd_panel_disp_on_off(panel, true);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "disp on fail"); return ret; }
 
-    buf1 = heap_caps_malloc(W * 40 * 2, MALLOC_CAP_SPIRAM);
-    buf2 = heap_caps_malloc(W * 40 * 2, MALLOC_CAP_SPIRAM);
-    if (!buf1 || !buf2) { ESP_LOGE(TAG, "malloc fail"); return ESP_ERR_NO_MEM; }
+    size_t draw_buf_bytes = W * DRAW_BUF_LINES * sizeof(uint16_t);
+    buf1 = heap_caps_malloc(draw_buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf1) {
+        ESP_LOGE(TAG, "draw buffer alloc fail (%u bytes internal)", (unsigned)draw_buf_bytes);
+        return ESP_ERR_NO_MEM;
+    }
+    buf2 = NULL;
 
     disp = lv_display_create(W, H);
     lv_display_set_flush_cb(disp, flush_cb);
-    lv_display_set_buffers(disp, buf1, buf2, W * 40 * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(disp, buf1, buf2, draw_buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     *out_disp = disp;
     ESP_LOGI(TAG, "Display 800x480 init ok");
