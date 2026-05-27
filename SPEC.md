@@ -163,6 +163,28 @@ Resolution summary:
 Current status:
 - resolved for current baseline.
 
+### 0.1) SSH immediate post-connect `rc=-4` regression (resolved)
+
+Observed in recent iterations:
+- session disconnected almost immediately with:
+  - `SSH rx read error: rc=-4`
+  - `libssh2 err=-4 msg=transport read`
+- negotiated set in failing runs commonly included:
+  - `c2s/s2c aes128-ctr`
+  - `mac_c2s/mac_s2c hmac-sha2-256`
+
+Fix used:
+- reverted SSH algorithm preference ordering in `main/ssh_client.cpp` to the
+  conservative set that had been stable earlier:
+  - ciphers: `aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr`
+  - MACs: `hmac-sha1,hmac-sha2-256,hmac-sha2-512`
+- added runtime negotiated-method logging and richer `rc<0` read/write context
+  logging to make future regressions attributable.
+
+Current status:
+- immediate blank-screen/immediate-disconnect behavior is resolved with the
+  above preference rollback.
+
 ### 1) Neovim DSR warning
 
 Observed warning:
@@ -223,6 +245,27 @@ main screen rendering.
 Status:
 - DCS parser-state extension is currently disabled.
 - This rollback is part of the known-good baseline.
+
+### 4) Intermittent SSH runtime `rc=-4` disconnects (open)
+
+Observed:
+- sessions can still terminate intermittently during normal command output
+  (example: running `git status` in remote shell).
+- recent captured failure:
+  - `rc=-4` / `transport read`
+  - negotiated `aes128-ctr` + `hmac-sha1`
+
+Status:
+- unresolved.
+- immediate regression is fixed, but long-run transport stability issue remains.
+
+Planned next steps:
+1. correlate next `rc=-4` with rekey timing/packet flow using existing runtime
+   negotiated/error logs and host-side capture.
+2. test narrower method pinning variants one axis at a time (MAC-only and
+   cipher-only permutations) to isolate the unstable combination.
+3. if needed, instrument libssh2 transport boundary around MAC verify failure
+   path for sequence/packet-size correlation.
 
 ## Known-Good Baseline (Current)
 

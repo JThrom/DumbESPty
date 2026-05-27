@@ -24,11 +24,19 @@ All notable changes to DumbESPty are documented in this file.
 - DERP and WireGuard manager log verbosity tuned for normal operation:
   - DERP TCP reconnect failures reported as warnings with errno text,
   - periodic WG/disco timing logs now only emit when slow.
+- SSH method preference ordering adjusted back to conservative prior order after
+  regression from CTR/SHA2-first ordering:
+  - ciphers: `aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr`
+  - MACs: `hmac-sha1,hmac-sha2-256,hmac-sha2-512`
 
 ### Fixed (UI/Terminal)
 - SSH handshake no longer fails at `Failed to get response to ssh-userauth request` after NEWKEYS due to strict-KEX sequence handling mismatch.
 - Restored interactive remote shell rendering on-device even when `ssh_recv` task allocation fails.
 - Eliminated immediate post-connect server FIN pattern caused by malformed/sequence-misaligned first encrypted userauth packet path.
+- Fixed immediate SSH blank-screen/disconnect regression (`rc=-4`, `transport read`) introduced by recent algorithm-preference iterations.
+- Added runtime SSH failure context logging (socket errno, libssh2 error text,
+  negotiated methods) to speed root-cause analysis of remaining intermittent
+  transport disconnects.
 
 ### Added
 - Touch status menu module with expanded drawer UI, outside-tap dismiss, and updated hit zones.

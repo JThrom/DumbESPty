@@ -63,6 +63,14 @@ Primary integration goal in the current phase: keep LazyVim rendering stable whi
 - DERP/WireGuard periodic log chatter was reduced for cleaner monitor output:
   - DERP reconnect/connect failures are warnings (with errno text),
   - periodic WG/disco timing logs only print on slow runs.
+- A recent immediate SSH disconnect regression (`rc=-4`, `transport read`) was
+  mitigated by restoring conservative method preference ordering:
+  - ciphers: `aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr`
+  - MACs: `hmac-sha1,hmac-sha2-256,hmac-sha2-512`
+
+Current note:
+- intermittent runtime `rc=-4` disconnects can still occur under some command
+  workloads; this remains an active investigation item.
 
 ## Status Menu and BLE Usage
 

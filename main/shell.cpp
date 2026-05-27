@@ -11,7 +11,6 @@
 #include "esp_log.h"
 #include "esp_app_desc.h"
 #include "esp_idf_version.h"
-#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -266,22 +265,17 @@ bool shell_is_ssh_active(void) {
 
 void shell_handle_key(char c) {
     if (ssh_active) {
-        if (c == 0x04) {
-            ssh_disconnect();
-            shell_set_ssh_active(false);
-        } else {
-            char buf[3];
-            int n;
-            if (c == 0x1C) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'D'; n = 3; }
-            else if (c == 0x1D) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'C'; n = 3; }
-            else if (c == 0x1E) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'A'; n = 3; }
-            else if (c == 0x1F) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'B'; n = 3; }
-            else { buf[0] = c; n = 1; }
-            if ((uint8_t)c == 0x1B) {
-                ESP_LOGI(TAG, "SSH key TX: ESC");
-            }
-            ssh_write(buf, n);
+        char buf[3];
+        int n;
+        if (c == 0x1C) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'D'; n = 3; }
+        else if (c == 0x1D) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'C'; n = 3; }
+        else if (c == 0x1E) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'A'; n = 3; }
+        else if (c == 0x1F) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'B'; n = 3; }
+        else { buf[0] = c; n = 1; }
+        if ((uint8_t)c == 0x1B) {
+            ESP_LOGI(TAG, "SSH key TX: ESC");
         }
+        ssh_write(buf, n);
         return;
     }
 
@@ -591,22 +585,8 @@ static void ssh_password_cb(const char *pass) {
     ssh_connect_pending = true;
     shell_print("\r\n  Connecting...");
 
-    char mem_line[160];
-    snprintf(mem_line, sizeof(mem_line),
-             "\r\n  mem before ssh task: free8=%u free_int=%u largest_int=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    shell_print(mem_line);
-
     if (!ensure_ssh_connect_worker()) {
         ssh_connect_pending = false;
-        snprintf(mem_line, sizeof(mem_line),
-                 "\r\n  mem after ssh worker fail: free8=%u free_int=%u largest_int=%u",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        shell_print(mem_line);
         shell_print("\r\n  SSH worker task create failed");
         free(ctx);
         return;

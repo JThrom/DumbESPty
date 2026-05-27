@@ -29,6 +29,7 @@ static const char *TAG = "SSH_CLIENT";
 #define SSH_CONNECT_RETRIES 3
 #define SSH_HANDSHAKE_RETRIES 3
 #define SSH_VERBOSE_LOGS 0
+#define SSH_USE_RX_TASK 0
 
 typedef struct {
     char data[SSH_RX_BUF_SIZE];
@@ -52,6 +53,7 @@ static int s_queue_drain_budget = 80;
 
 static size_t filter_and_reply_fast_queries(const char *src, size_t len, char *dst);
 static void log_rx_trace(const char *data, size_t len);
+static void log_ssh_runtime_error_context(const char *where, int rc);
 
 static void ssh_handle_rx_bytes(const char *src, size_t len) {
     size_t offset = 0;
@@ -89,7 +91,7 @@ static void ssh_pump_rx_once(int max_reads) {
             break;
         }
 
-        ESP_LOGW(TAG, "SSH rx read error: rc=%d", rc);
+        log_ssh_runtime_error_context("SSH rx read error", rc);
         ssh_connected = false;
         break;
     }
@@ -293,6 +295,44 @@ static void delete_rx_queue(void) {
 }
 
 static int waitsocket(int sock, LIBSSH2_SESSION *sess);
+
+static const char *safe_method_name(int method_type) {
+    if (!session) return "n/a";
+    const char *m = libssh2_session_methods(session, method_type);
+    return (m && m[0]) ? m : "n/a";
+}
+
+static void log_ssh_runtime_error_context(const char *where, int rc) {
+    int sock_errno = errno;
+    int last_errno = session ? libssh2_session_last_errno(session) : 0;
+
+    ESP_LOGW(TAG,
+             "%s: rc=%d sock_errno=%d (%s) libssh2_last_errno=%d",
+             where,
+             rc,
+             sock_errno,
+             strerror(sock_errno),
+             last_errno);
+
+    if (session) {
+        char *errmsg = NULL;
+        int errmsg_len = 0;
+        int errcode = libssh2_session_last_error(session, &errmsg, &errmsg_len, 0);
+        if (errmsg && errmsg_len > 0) {
+            ESP_LOGW(TAG, "%s: libssh2 err=%d msg=%.*s", where, errcode, errmsg_len, errmsg);
+        }
+
+        ESP_LOGW(TAG,
+                 "%s: negotiated kex=%s hostkey=%s c2s=%s s2c=%s mac_c2s=%s mac_s2c=%s",
+                 where,
+                 safe_method_name(LIBSSH2_METHOD_KEX),
+                 safe_method_name(LIBSSH2_METHOD_HOSTKEY),
+                 safe_method_name(LIBSSH2_METHOD_CRYPT_CS),
+                 safe_method_name(LIBSSH2_METHOD_CRYPT_SC),
+                 safe_method_name(LIBSSH2_METHOD_MAC_CS),
+                 safe_method_name(LIBSSH2_METHOD_MAC_SC));
+    }
+}
 
 static void log_session_error(const char *stage) {
     if (!session) return;
@@ -498,6 +538,7 @@ static int waitsocket(int sock, LIBSSH2_SESSION *sess) {
     return select(sock + 1, &rfds, &wfds, NULL, &timeout);
 }
 
+#if SSH_USE_RX_TASK
 static void ssh_recv_task(void *param) {
     char buf[1024];
     ESP_LOGD(TAG, "SSH recv task started");
@@ -513,7 +554,7 @@ static void ssh_recv_task(void *param) {
             waitsocket(ssh_sock, session);
             vTaskDelay(pdMS_TO_TICKS(10));
         } else {
-            ESP_LOGW(TAG, "SSH rx read error: rc=%d", rc);
+            log_ssh_runtime_error_context("SSH rx read error", rc);
             break;
         }
 
@@ -525,6 +566,7 @@ static void ssh_recv_task(void *param) {
     ssh_recv_task_handle = NULL;
     vTaskDelete(NULL);
 }
+#endif
 
 bool ssh_connect(const char *host, uint16_t port, const char *user, const char *pass) {
     if (ssh_connected) {
@@ -769,12 +811,22 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     s_rx_loop_budget = 120;
     s_queue_drain_budget = 80;
 
+    ESP_LOGI(TAG,
+             "Negotiated: kex=%s hostkey=%s c2s=%s s2c=%s mac_c2s=%s mac_s2c=%s",
+             safe_method_name(LIBSSH2_METHOD_KEX),
+             safe_method_name(LIBSSH2_METHOD_HOSTKEY),
+             safe_method_name(LIBSSH2_METHOD_CRYPT_CS),
+             safe_method_name(LIBSSH2_METHOD_CRYPT_SC),
+             safe_method_name(LIBSSH2_METHOD_MAC_CS),
+             safe_method_name(LIBSSH2_METHOD_MAC_SC));
+
     /* Return to non-blocking mode for interactive operation loops. */
     if (!set_socket_blocking_mode(ssh_sock, false)) {
         ESP_LOGW(TAG, "Failed to restore SSH socket non-blocking mode");
     }
     libssh2_session_set_blocking(session, 0);
 
+#if SSH_USE_RX_TASK
     ESP_LOGD(TAG, "Starting SSH recv task...");
     BaseType_t rx_task_ok = xTaskCreatePinnedToCore(ssh_recv_task,
                                                     "ssh_recv",
@@ -795,6 +847,9 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         ESP_LOGW(TAG, "Failed to create ssh_recv task, using foreground RX pump");
         ssh_recv_task_handle = NULL;
     }
+#else
+    ssh_recv_task_handle = NULL;
+#endif
     coex_release();
 
     ESP_LOGI(TAG, "SSH connected to %s:%d as %s", host, port, user);
@@ -859,6 +914,7 @@ int ssh_write(const char *data, int len) {
             continue;
         }
         if (rc < 0) {
+            log_ssh_runtime_error_context("SSH write error", rc);
             ssh_connected = false;
             xSemaphoreGive(ssh_write_mutex);
             return rc;
