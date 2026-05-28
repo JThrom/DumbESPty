@@ -55,12 +55,16 @@ extern "C" void app_main(void) {
     }
     ESP_LOGI(TAG, "NVS init OK");
 
+#if CONFIG_IDF_TARGET_ESP32S3
     ret = ch422g_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "CH422G init failed: %s", esp_err_to_name(ret));
         return;
     }
     ESP_LOGI(TAG, "CH422G init OK");
+#else
+    ESP_LOGI(TAG, "Skipping CH422G init on this target");
+#endif
 
     if (esp_psram_is_initialized())
         ESP_LOGI(TAG, "PSRAM initialized");
@@ -141,7 +145,9 @@ extern "C" void app_main(void) {
 
     // Init BLE HID host
     ret = ble_hid_host_init();
-    if (ret != ESP_OK) {
+    if (ret == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGI(TAG, "BLE HID host unsupported on this target; continuing without BLE keyboard");
+    } else if (ret != ESP_OK) {
         ESP_LOGE(TAG, "BLE HID host init failed: %s", esp_err_to_name(ret));
         shell_print("\r\n  BLE HID Error");
     } else {

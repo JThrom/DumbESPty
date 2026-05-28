@@ -255,6 +255,11 @@ esp_err_t wifi_mgr_init(void) {
     secret_vault_init();
 
     wifi_msg_queue = xQueueCreate(WIFI_MSG_QUEUE_SIZE, sizeof(wifi_msg_t));
+
+#if CONFIG_IDF_TARGET_ESP32P4
+    ESP_LOGI(TAG, "Wi-Fi init on esp32p4 via esp-hosted");
+#endif
+
     esp_err_t ret = esp_netif_init();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "netif init: %s", esp_err_to_name(ret)); return ret; }
 
@@ -311,6 +316,7 @@ esp_err_t wifi_mgr_apply_hostname(const char *hostname) {
 }
 
 void wifi_mgr_process_queue(void) {
+    if (!wifi_msg_queue) return;
     wifi_msg_t msg;
     while (xQueueReceive(wifi_msg_queue, &msg, 0) == pdTRUE) {
         shell_print(msg.text);

@@ -273,6 +273,16 @@ Optional monitor:
 idf.py -p /dev/ttyACM1 monitor
 ```
 
+ESP32-P4 bring-up note (important):
+
+- Waveshare ESP32-P4-WIFI6-Touch-LCD-7B reports `32MB` flash.
+- If image header is left at `8MB`, boot logs show:
+  - `Detected size(32768k) larger than the size in the binary image header(8192k)`
+- This project now pins P4 defaults to `32MB` in `sdkconfig.defaults.esp32p4`:
+  - `CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y`
+  - `CONFIG_ESPTOOLPY_FLASHSIZE="32MB"`
+- Keep these settings. This mismatch consumed multiple failed bring-up attempts previously.
+
 ## Known-Good Baseline
 
 - LazyVim main screen currently loads correctly.
