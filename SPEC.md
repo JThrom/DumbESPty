@@ -147,6 +147,16 @@ idf.py build
 idf.py -p /dev/ttyACM1 flash
 ```
 
+ESP32-P4 flash size note (captured after repeated bring-up failures):
+
+- Waveshare ESP32-P4-WIFI6-Touch-LCD-7B uses `32MB` SPI flash.
+- Leaving image header at `8MB` produces runtime warning:
+  - `Detected size(32768k) larger than the size in the binary image header(8192k)`
+- P4 defaults must keep:
+  - `CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y`
+  - `CONFIG_ESPTOOLPY_FLASHSIZE="32MB"`
+- These settings are stored in `sdkconfig.defaults.esp32p4` and should not be reverted.
+
 ## Current Bug Worklist
 
 ### 0) SSH handshake/auth regression (resolved in this cycle)
@@ -266,6 +276,145 @@ Planned next steps:
    cipher-only permutations) to isolate the unstable combination.
 3. if needed, instrument libssh2 transport boundary around MAC verify failure
    path for sequence/packet-size correlation.
+
+### 5) BLE HID handshake/auth stall on ESP32-P4 hosted stack (open, current priority)
+
+Current symptom profile (2026-05-28):
+- Keyboard is discoverable and often connectable.
+- HID + vendor services can be discovered and CCCD writes can succeed.
+- No key input reaches shell (`notify rx` does not arrive in failing runs).
+- Keyboard LED fast-blink pattern suggests pairing / secure-link handshake is not
+  fully accepted by one side.
+- Disconnects occur with timeout reasons such as:
+  - `disconnect reason=520(hci-conn-timeout)`.
+
+Scope and platform context:
+- Primary repro target: Waveshare ESP32-P4-WIFI6-Touch-LCD-7B (`esp32p4`) using
+  ESP-Hosted (C6 co-processor over VHCI).
+- Working assumption is platform/hosted-behavior difference vs prior
+  ESP32-S3-centered baseline.
+- Investigation order intentionally prioritizes hardware/hosted compatibility
+  over refactor/cleanup.
+
+Detailed changes already implemented in this cycle:
+
+1) Scan/connect stability and observability
+- Added high-granularity GAP/GATT logs in `main/ble_hid_host.cpp` for:
+  - connect / disconnect / encryption change,
+  - service/characteristic/descriptor discovery,
+  - CCCD subscribe attempts and result codes.
+- Added periodic scan counters:
+  - events seen, HID candidates, add/update counts, result list totals.
+- Fixed crash source in scan bookkeeping:
+  - removed `ESP_LOG*` calls from inside `portENTER_CRITICAL` region
+    (`add_or_update_scan_result`), logging moved outside lock.
+
+2) Input path instrumentation
+- Added runtime telemetry for keyboard reports:
+  - `notify rx #... attr=... len=...`,
+  - `notify preview ...`,
+  - decode counters (`ok`, `drop`).
+- `handle_kbd_report(...)` success/failure now tracked by caller.
+
+3) HID handshake behavior experiments
+- Added writes where available:
+  - HID Control Point `0x2A4C` -> `0x00` (exit suspend),
+  - HID Protocol Mode `0x2A4E` -> `0x01` (report mode).
+- Generalized CCCD subscribe helper to support notify and indicate bitmasks
+  with reason tags.
+- Added vendor service discovery path for `0xFF50` and attempted subscription on
+  any notify/indicate-capable vendor characteristics.
+
+4) Pairing/security behavior experiments
+- Security rc decoding expanded (`sm-peer-*`, `hci-*`, etc.).
+- Tried delayed security initiation fallback after connect; observed failures
+  like `encryption change status=1288(sm-peer-unspecified)` and no usable input.
+- Current branch now includes explicit security initiation checkpoints with logs:
+  - after connect,
+  - after link establishment.
+- Current branch also includes additional GAP event handlers/logs for:
+  - `PASSKEY_ACTION`,
+  - `PARING_COMPLETE` (as named in NimBLE headers),
+  - `REPEAT_PAIRING`,
+  - conn update / MTU / identity resolved / term failure.
+- Bond-store plumbing added (NimBLE store init + status callback):
+  - `ble_store_config_init()`,
+  - `ble_hs_cfg.store_status_cb = ble_store_util_status_rr`.
+
+5) Auto-reconnect logic tweak for hosted advertisements
+- Reconnect-by-prefix no longer requires `adv_looks_like_hid_keyboard()` to be
+  true before attempting connect.
+- This avoids missing reconnect opportunities when the paired device advertises
+  differently in some states.
+
+UI-side debugging quality-of-life updates:
+- BLE section moved higher in status menu and list area enlarged.
+- Scan result list changed to vertical flex layout with better row spacing.
+- Device rows now prefer discovered name + addr suffix instead of generic
+  `Keyboard N` labels.
+
+Observed outcomes after the above:
+- Confirmed runs where device connects and discovers at least:
+  - HID service `0x1812`,
+  - vendor service `0xFF50`,
+  - multiple HID input candidates with successful CCCD write logs.
+- Despite this, no stable key-report stream is observed in failing sessions.
+- Some sessions fail earlier with connect status `13` (decoded as HCI-space
+  status code) and then retry.
+
+Most probable failure classes at this point:
+1. Security procedure mismatch with this keyboard in hosted transport path
+   (peer expects explicit pairing sequence and rejects implicit/no-IO path).
+2. Notification path attached to unexpected characteristic/report-id stream
+   (vendor or non-boot format), so valid traffic is not reaching current
+   decode path.
+3. ESP-Hosted event propagation/timing issue where specific GAP security events
+   are dropped or late, causing peer-side timeout and disconnect.
+
+What has *not* solved the issue so far:
+- HID-only subscription strategy.
+- Vendor-service subscription attempts on currently discovered notifiable chars.
+- Control-point/protocol-mode writes alone.
+- Prior delayed security initiate attempt.
+
+High-signal log lines to capture in future runs:
+- `security initiate (...) rc=...`
+- `passkey action ...`
+- `pairing complete ...`
+- `repeat pairing ...`
+- `encryption change status=...`
+- `disconnect reason=...(...)`
+- first `notify rx ...` (if any)
+
+Recommended next investigation steps (ordered):
+1. Confirm presence/absence of new security logs on current firmware image.
+   - If absent in a run, first verify image actually includes latest
+     instrumentation and that monitor session is attached from boot.
+2. If passkey/numcmp events appear:
+   - implement explicit `ble_sm_inject_io(...)` policy for NO_IO-compatible
+     actions and log each decision path.
+3. If repeat pairing appears:
+   - keep bond-delete + retry path, and add explicit bond-store dump counters
+     before/after delete for confidence.
+4. If security initiate succeeds but still no reports:
+   - temporarily subscribe to all notify/indicate chars in discovered HID and
+     vendor services as a capture probe, then map active attr handles.
+5. Add per-connection subscription map dump:
+   - value handle, CCCD handle, bitmask, service UUID context.
+6. If disconnect remains timeout-only with no security events:
+   - instrument hosted/VHCI boundary and compare against an ESP-IDF HID host
+     example on same board to isolate stack vs app behavior.
+
+Execution/validation checklist for next agent handoff:
+- Build and flash from this repo root using current IDF export flow.
+- Capture boot-to-disconnect serial logs with timestamps for one full BLE
+  connect attempt.
+- Attach exact keyboard action timeline (power on, wake, key press cadence,
+  pairing mode button use, LED behavior transitions).
+- Record whether disconnect reason remains `520(hci-conn-timeout)` or changes
+  after security-init paths are active.
+- Preserve logs verbatim in ticket/commit notes before attempting further logic
+  changes.
 
 ## Known-Good Baseline (Current)
 
