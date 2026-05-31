@@ -18,5 +18,4 @@ dependencies:
   espressif/esp_lcd_touch_gt911: ^1.2.0~2
   espressif/cjson: ^1.7.19
   lvgl/lvgl: ^9.4.0
-  espressif/usb: '*'
   skuodi/libssh2_esp: ^1.1.0

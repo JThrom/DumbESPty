@@ -42,6 +42,7 @@ static const char *TAG = "ml_coord";
 /* NodeKeyChallenge from EarlyNoise (stored between handshake and register) */
 static uint8_t s_node_key_challenge[32] = {0};
 static bool s_has_node_key_challenge = false;
+static char s_node_key_signature_json[768] = {0};
 
 /* Cached control-plane endpoint from last successful DNS resolve.
  * Used as fallback when transient DNS lookups fail during reconnect loops. */
@@ -86,6 +87,18 @@ static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
         bytes[i] = (uint8_t)val;
     }
     return hex_len / 2;
+}
+
+static void maybe_add_node_key_signature(cJSON *root) {
+    if (!root || !s_node_key_signature_json[0]) return;
+
+    cJSON *sig = cJSON_Parse(s_node_key_signature_json);
+    if (!sig) {
+        ESP_LOGW(TAG, "failed to parse cached NodeKeySignature JSON");
+        return;
+    }
+
+    cJSON_AddItemToObject(root, "NodeKeySignature", sig);
 }
 
 /* ============================================================================
@@ -834,6 +847,8 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     if (!resp_buf) { free(h2_resp); return -1; }
     size_t resp_total = 0;
 
+    bool recv_error = false;
+
     /* Accumulate Noise frames into H2 buffer.
      * Scan each frame for H2 END_STREAM on stream 1 to break early
      * instead of blocking 60s waiting for more data that won't come. */
@@ -843,7 +858,12 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         if (!frame_buf) break;
 
         int frame_len = noise_recv(ml, noise, frame_buf, 4096);
-        if (frame_len <= 0) {
+        if (frame_len < 0) {
+            recv_error = true;
+            free(frame_buf);
+            break;
+        }
+        if (frame_len == 0) {
             free(frame_buf);
             break;
         }
@@ -921,10 +941,13 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     ESP_LOGI(TAG, "RegisterResponse: %d bytes total data", (int)resp_total);
 
     if (resp_total == 0) {
-        ESP_LOGW(TAG, "No DATA frame in RegisterResponse");
+        if (recv_error) {
+            ESP_LOGE(TAG, "RegisterResponse receive failed before DATA frame");
+        } else {
+            ESP_LOGW(TAG, "No DATA frame in RegisterResponse");
+        }
         free(resp_buf);
-        /* Not fatal - server may just return headers-only 200 */
-        return 0;
+        return -1;
     }
 
     uint8_t *json_data = resp_buf;
@@ -976,6 +999,28 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     parse_start[parse_len] = saved;
     free(resp_buf);
 
+    /* Cache NodeKeySignature for subsequent /machine/map requests. */
+    {
+        cJSON *sig = cJSON_GetObjectItem(resp_json, "NodeKeySignature");
+        if (sig && !cJSON_IsNull(sig)) {
+            char *sig_json = cJSON_PrintUnformatted(sig);
+            if (sig_json) {
+                snprintf(s_node_key_signature_json,
+                         sizeof(s_node_key_signature_json),
+                         "%s",
+                         sig_json);
+                ESP_LOGI(TAG,
+                         "cached NodeKeySignature (%u bytes)",
+                         (unsigned)strlen(s_node_key_signature_json));
+                free(sig_json);
+            } else {
+                ESP_LOGW(TAG, "NodeKeySignature present but failed to serialize");
+            }
+        } else {
+            s_node_key_signature_json[0] = '\0';
+        }
+    }
+
     /* Extract our VPN IP from Node.Addresses */
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
     if (node) {
@@ -1024,6 +1069,61 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
             bytes_to_hex(ml->wg_public_key, 32, our_key_hex);
             ESP_LOGI(TAG, "Our WG pubkey (local):       nodekey:%s", our_key_hex);
         }
+    } else {
+        cJSON *auth_url = cJSON_GetObjectItem(resp_json, "AuthURL");
+        cJSON *url = cJSON_GetObjectItem(resp_json, "URL");
+        cJSON *err = cJSON_GetObjectItem(resp_json, "Error");
+        cJSON *msg = cJSON_GetObjectItem(resp_json, "Message");
+        cJSON *machine_authorized = cJSON_GetObjectItem(resp_json, "MachineAuthorized");
+
+        if (machine_authorized && cJSON_IsTrue(machine_authorized)) {
+            ESP_LOGW(TAG, "RegisterResponse has no Node but MachineAuthorized=true; continuing to map");
+            if (!s_node_key_signature_json[0]) {
+                ESP_LOGW(TAG, "NodeKeySignature missing/empty; map may still fail");
+            }
+            cJSON_Delete(resp_json);
+            int64_t t_reg_done = esp_timer_get_time();
+            ESP_LOGI(TAG, "[TIMING] Register total: %lld ms", (t_reg_done - t_reg_start) / 1000);
+            return 0;
+        }
+
+        if (auth_url && cJSON_IsString(auth_url) && auth_url->valuestring && auth_url->valuestring[0]) {
+            ESP_LOGE(TAG, "RegisterResponse missing Node; device authorization required");
+            ESP_LOGE(TAG, "AuthURL: %s", auth_url->valuestring);
+        } else if (url && cJSON_IsString(url) && url->valuestring && url->valuestring[0]) {
+            ESP_LOGE(TAG, "RegisterResponse missing Node; device authorization required");
+            ESP_LOGE(TAG, "URL: %s", url->valuestring);
+        } else if (err && cJSON_IsString(err) && err->valuestring) {
+            ESP_LOGE(TAG, "RegisterResponse error: %s", err->valuestring);
+        } else if (msg && cJSON_IsString(msg) && msg->valuestring) {
+            ESP_LOGE(TAG, "RegisterResponse message: %s", msg->valuestring);
+        } else {
+            ESP_LOGE(TAG, "RegisterResponse missing Node; control plane did not register this node");
+        }
+
+        /* Log top-level fields to make control-plane rejection reasons visible. */
+        {
+            ESP_LOGE(TAG, "RegisterResponse top-level fields:");
+            cJSON *field = NULL;
+            cJSON_ArrayForEach(field, resp_json) {
+                if (!field->string) continue;
+                if (cJSON_IsArray(field)) {
+                    ESP_LOGE(TAG, "  - %s (array, size=%d)", field->string, cJSON_GetArraySize(field));
+                } else if (cJSON_IsObject(field)) {
+                    ESP_LOGE(TAG, "  - %s (object)", field->string);
+                } else if (cJSON_IsString(field)) {
+                    ESP_LOGE(TAG, "  - %s (string): %.96s", field->string, field->valuestring ? field->valuestring : "");
+                } else if (cJSON_IsNumber(field)) {
+                    ESP_LOGE(TAG, "  - %s (number): %g", field->string, field->valuedouble);
+                } else if (cJSON_IsBool(field)) {
+                    ESP_LOGE(TAG, "  - %s (bool): %s", field->string, cJSON_IsTrue(field) ? "true" : "false");
+                } else {
+                    ESP_LOGE(TAG, "  - %s (other)", field->string);
+                }
+            }
+        }
+        cJSON_Delete(resp_json);
+        return -1;
     }
 
     cJSON_Delete(resp_json);
@@ -1344,6 +1444,8 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
     cJSON_AddStringToObject(root, "NodeKey", key_str);
 
+    maybe_add_node_key_signature(root);
+
     /* DiscoKey */
     bytes_to_hex(ml->disco_public_key, 32, key_hex);
     snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);
@@ -1609,6 +1711,10 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     if (!map_json) {
         const char *err = cJSON_GetErrorPtr();
         ESP_LOGE(TAG, "MapResponse JSON parse failed near: %.50s", err ? err : "unknown");
+        if (strstr(parse_start, "node not found") != NULL) {
+            ESP_LOGE(TAG, "Control plane returned 'node not found' for /machine/map");
+            ESP_LOGE(TAG, "Likely cause: node registration/authorization did not complete");
+        }
         free(resp_buf);
         return -1;
     }
@@ -1833,6 +1939,8 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
     cJSON_AddStringToObject(root, "NodeKey", key_str);
 
+    maybe_add_node_key_signature(root);
+
     bytes_to_hex(ml->disco_public_key, 32, key_hex);
     snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);
     cJSON_AddStringToObject(root, "DiscoKey", key_str);
@@ -1931,6 +2039,8 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     bytes_to_hex(ml->wg_public_key, 32, key_hex);
     snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
     cJSON_AddStringToObject(root, "NodeKey", key_str);
+
+    maybe_add_node_key_signature(root);
 
     bytes_to_hex(ml->disco_public_key, 32, key_hex);
     snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);

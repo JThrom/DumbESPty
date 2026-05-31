@@ -7,10 +7,10 @@ this repository.
 
 - Project: `DumbESPty`
 - Primary branch for active work: `master`
-- Hardware target: ESP32-S3
-- Typical flash port: `/dev/ttyACM1`
-- Current goal: keep terminal rendering stable for LazyVim while improving
-  terminal compatibility (especially Neovim/DSR behavior).
+- Hardware target: ESP32-P4 (primary), ESP32-S3 (legacy path)
+- Typical flash port: `/dev/ttyACM0`
+- Current goal: keep terminal rendering stable for LazyVim while executing the
+  phased SSH compatibility plan toward Linux-like server/auth coverage.
 
 ## Build and Flash
 
@@ -20,13 +20,13 @@ Use this exact flow unless the user says otherwise:
 export IDF_PATH="$HOME/projects/esp-idf"
 . "$IDF_PATH/export.sh"
 idf.py build
-idf.py -p /dev/ttyACM1 flash
+idf.py -p /dev/ttyACM0 flash
 ```
 
 Optional monitor:
 
 ```bash
-idf.py -p /dev/ttyACM1 monitor
+idf.py -p /dev/ttyACM0 monitor
 ```
 
 ## Active Runtime Architecture
@@ -40,8 +40,8 @@ Core modules in active use:
 - `main/shell.cpp`, `main/shell.hpp`
 - `main/wifi_mgr.cpp`, `main/wifi_mgr.hpp`
 - `main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`
-- `main/coex_manager.cpp`, `main/coex_manager.hpp`
-- `main/waveshare_display.cpp`, `main/include/waveshare_display.hpp`
+- `main/coex_manager.cpp`, `main/coex_manager_stub.cpp`, `main/coex_manager.hpp`
+- `main/waveshare_display_p4.cpp`, `main/include/waveshare_display.hpp`
 - `main/ch422g_init.cpp`, `main/include/ch422g_init.hpp`
 
 Active font assets:
@@ -53,14 +53,20 @@ Active font assets:
 ## Known-Good Rendering Baseline
 
 - LazyVim main screen currently loads correctly.
-- Keep terminal grid and geometry aligned with current baseline:
-  - 100 columns x 32 rows
-  - cell size 8 x 15
+- Keep terminal geometry derived from display resolution using cell size `8 x 15`.
+  - On current P4 panel (`1024 x 600`), baseline grid is `128 x 40`.
 - Keep Cozette primary + LVGL fallback font flow.
 
 ## Open Bugs (Current Priority)
 
-1. Neovim DSR warning:
+1. SSH host key compatibility gap (highest priority):
+   - Current libssh2+mbedTLS build does not support `ssh-ed25519` host keys.
+   - Servers offering only `ssh-ed25519` fail handshake with
+     `Unable to exchange encryption keys`.
+   - Short-term workaround is server-side ECDSA/RSA host key enablement.
+   - Long-term fix is Phase 1 of SSH roadmap (client-side ed25519 support).
+
+2. Neovim DSR warning:
    - Message: `Did not detect DSR response from terminal`
    - Existing code replies to DSR in both terminal parser and SSH fast path.
    - Remaining issue appears timing/order/capability related.
@@ -68,11 +74,25 @@ Active font assets:
      `TERM=xterm-256color` using `nvim --clean`.
    - Investigation is currently paused; see `SPEC.md` for full attempt log.
 
-2. Nerd Font gaps:
+3. Nerd Font gaps:
    - Symbol font was regenerated to include observed missing codepoints:
      `U+F09AA`, `U+F0AF5`, `U+F0E2D`.
    - If new `Missing glyph U+....` warnings appear, add exact codepoints to
      font generation range and reflash.
+
+## SSH Compatibility Roadmap (Phased)
+
+1. Phase 1: host key compatibility
+   - Add client support for `ssh-ed25519` host keys.
+2. Phase 2: auth method coverage
+   - Ensure robust `publickey`, `keyboard-interactive`, `password`, `none`
+     negotiation behavior.
+3. Phase 3: key management
+   - Vault-backed key storage/import and passphrase handling.
+4. Phase 4: host trust model
+   - `known_hosts`/fingerprint pinning and mismatch protections.
+5. Phase 5: compatibility polish
+   - Improve default preferences/fallbacks to match Linux-client expectations.
 
 ## Input Compatibility Notes
 

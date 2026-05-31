@@ -92,7 +92,9 @@ static const char *passkey_action_to_text(uint8_t action) {
         case BLE_SM_IOACT_DISP: return "display";
         case BLE_SM_IOACT_NUMCMP: return "numcmp";
         case BLE_SM_IOACT_OOB_SC: return "oob_sc";
+#ifdef BLE_SM_IOACT_STATIC
         case BLE_SM_IOACT_STATIC: return "static";
+#endif
         default: return "unknown";
     }
 }
@@ -1017,7 +1019,7 @@ static int gatt_disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *e
 
     if (chr->uuid.u.type == BLE_UUID_TYPE_16 && chr->uuid.u16.value == 0x2A4E &&
         (chr->properties & (BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP))) {
-        write_hid_char_u8(conn_handle, chr->val_handle, 0x01, "hid protocol mode report");
+        write_hid_char_u8(conn_handle, chr->val_handle, 0x00, "hid protocol mode boot");
     }
 
     return 0;
@@ -1685,7 +1687,13 @@ esp_err_t ble_hid_host_init(void) {
     ble_svc_gap_device_name_set("DumbESPty");
 
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+#if CONFIG_IDF_TARGET_ESP32P4
+    ble_hs_cfg.sm_sc = 0;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_bonding = 0;
+#else
     ble_hs_cfg.sm_bonding = 1;
+#endif
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_hs_cfg.sync_cb = nimble_sync_cb;
     ble_hs_cfg.reset_cb = nimble_reset_cb;

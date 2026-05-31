@@ -17,19 +17,57 @@
 Name meaning:
 
 - `Dumb`: a classic dumb terminal interaction model.
-- `ESP`: powered by an Espressif ESP32-S3 MCU.
+- `ESP`: powered by an Espressif ESP32 MCU family target (primary: ESP32-P4).
 - `PTY`: pseudo-terminal behavior over SSH (remote shell/editor terminal endpoint).
 
 ## Overview
 
-DumbESPty is a portable, color dumb-terminal style system built on a Waveshare 7-inch ESP32-S3 touch display board. It combines:
+DumbESPty is a portable, color dumb-terminal style system built for Waveshare 7-inch ESP32 touch display boards, with primary active work on ESP32-P4-WIFI6-Touch-LCD-7B. It combines:
 
 - Wi-Fi station connectivity
 - BLE HID keyboard input
 - VT100/xterm-style color terminal emulation rendered via LVGL
 - SSHv2 transport via libssh2
 
-Primary integration goal in the current phase: keep LazyVim rendering stable while improving compatibility with modern `zsh`/`oh-my-zsh` and `neovim` terminal behavior (especially DSR-related behavior).
+Primary integration goal in the current phase: keep LazyVim rendering stable while driving SSH compatibility toward Linux-client behavior across mixed server/auth configurations.
+
+## Current Status (2026-05)
+
+- ESP32-P4 build/flash baseline is stable on ESP-IDF 6.1.
+- Display geometry is now derived from panel resolution at runtime:
+  - P4: `1024x600` panel -> terminal grid `128x40` at `8x15`.
+- Shell SSH command accepts both OpenSSH-like forms:
+  - `ssh host[:port]`
+  - `ssh user@host[:port]`
+- SSH auth flow now probes server methods before prompting:
+  - supports `none` probe,
+  - supports `keyboard-interactive` fallback,
+  - prompts for password only when password-style auth is actually required.
+- Known hard limitation in current libssh2+mbedTLS build:
+  - client does not support `ssh-ed25519` host keys,
+  - servers that offer only `ssh-ed25519` fail during handshake (`Unable to exchange encryption keys`).
+
+## SSH Compatibility Roadmap (Phased)
+
+Phase 1 - Host Key Compatibility (highest priority)
+- Enable `ssh-ed25519` host key support in the device SSH stack.
+- Keep ECDSA/RSA host key compatibility.
+
+Phase 2 - Auth Method Matrix
+- Ensure robust method negotiation across `publickey`, `keyboard-interactive`, `password`, and `none`.
+- Keep prompt behavior minimal and method-aware.
+
+Phase 3 - Key Management
+- Add encrypted private-key storage in vault.
+- Add key import/select UX and optional passphrase support.
+
+Phase 4 - Host Trust Model
+- Add `known_hosts` style fingerprint pinning (TOFU + persisted trust).
+- Add mismatch warnings and safe refusal path.
+
+Phase 5 - Linux-like UX Polish
+- Improve per-host defaults, algorithm fallback behavior, and failure diagnostics.
+- Preserve terminal rendering stability while increasing server compatibility breadth.
 
 ## Recent Feature Additions
 
@@ -93,8 +131,8 @@ Behavior notes:
 
 - Project: `DumbESPty`
 - Branch: `master`
-- Hardware target: ESP32-S3
-- Typical flash port: `/dev/ttyACM1`
+- Hardware target: ESP32-P4 (primary active target)
+- Typical flash port: `/dev/ttyACM0`
 - Semantic firmware version: `1.0.0`
 
 ## Runtime Architecture
@@ -129,8 +167,8 @@ Core modules in active use:
 - `main/shell.cpp`, `main/shell.hpp`
 - `main/wifi_mgr.cpp`, `main/wifi_mgr.hpp`
 - `main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`
-- `main/coex_manager.cpp`, `main/coex_manager.hpp`
-- `main/waveshare_display.cpp`, `main/include/waveshare_display.hpp`
+- `main/coex_manager.cpp`, `main/coex_manager_stub.cpp`, `main/coex_manager.hpp`
+- `main/waveshare_display_p4.cpp`, `main/include/waveshare_display.hpp`
 - `main/ch422g_init.cpp`, `main/include/ch422g_init.hpp`
 
 ### Terminal (`main/terminal.cpp`, `main/terminal.hpp`)
@@ -158,7 +196,7 @@ Implemented compatibility areas:
 Rendering notes:
 
 - Cozette bitmap primary + LVGL fallback flow
-- Grid baseline: `100 x 32`, cell size `8 x 15`
+- Grid is derived from display resolution using cell `8 x 15`
 - Icon fallback remaps include `U+F426`, `U+E348`, `U+F0B37`, `U+F12B7`, and `U+F1064` to `U+F15B`
 
 ### SSH Client (`main/ssh_client.cpp`, `main/ssh_client.hpp`)
@@ -170,12 +208,19 @@ Rendering notes:
 - `ssh_write_mutex` for serialized writes
 - Fast DSR filter/reply path for `CSI 5n` and `CSI ?5n`
 - Optional RX trace for compatibility debugging
+- Auth behavior:
+  - server auth-method probe before prompting,
+  - `keyboard-interactive` auth support,
+  - deferred password prompt when password-style auth is required.
+- Current limitation:
+  - `ssh-ed25519` host key negotiation is not available in current libssh2+mbedTLS build.
 
 ### Shell (`main/shell.cpp`, `main/shell.hpp`)
 
 - Local command handling (`help`, `wifi`, `ssh`, `clear`, `about`)
 - SSH passthrough mode toggling
-- Password capture callback
+- SSH target parsing supports both `user@host` and host-only forms
+- Password capture callback (only when method probe indicates it is needed)
 - Escape/arrow/backspace behavior integrated with terminal output
 
 ### BLE HID Host (`main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`)
@@ -212,14 +257,14 @@ Known symbol additions for LazyVim compatibility:
 
 The `about` command prints a full-color info screen including:
 
-- Product: `Waveshare ESP32-S3-Touch-LCD-7`
+- Product and MCU strings selected by build target (ESP32-P4 vs ESP32-S3)
 - DumbESPty version: runtime app metadata (currently `1.0.0`)
 - Author: `Jason Throm`
 - GitHub: `https://github.com/JThrom/DumbESPty`
 - License: `GNU/GPL v2`
-- Display details: `7-inch RGB panel`, terminal grid `100 x 32`, cell `8 x 15`
+- Display details: `7-inch panel`, live terminal grid and cell size values
 - Controller helper: `CH422G I2C expander init path enabled`
-- MCU: ESP32-S3 (dual-core Xtensa LX7, Wi-Fi + BLE)
+- MCU: target-dependent runtime string (ESP32-P4 or ESP32-S3)
 - ESP-IDF version (runtime)
 - FreeRTOS version (runtime)
 - LVGL version (runtime macro values)
@@ -233,14 +278,12 @@ Locked dependency versions from `dependencies.lock`:
 - `idf`: `6.1.0`
 - `lvgl/lvgl`: `9.5.0`
 - `skuodi/libssh2_esp`: `1.1.0`
-- `espressif/usb`: `1.4.0`
 - `espressif/esp_lcd_touch`: `1.2.1`
 - `espressif/esp_lcd_touch_gt911`: `1.2.0~2`
 
 Direct dependency set:
 
 - `espressif/esp_lcd_touch_gt911`
-- `espressif/usb`
 - `idf`
 - `lvgl/lvgl`
 - `skuodi/libssh2_esp`
@@ -253,7 +296,6 @@ Project/component declarations:
   - `idf >= 5.3.0`
   - `espressif/esp_lcd_touch_gt911 ^1.2.0~2`
   - `lvgl/lvgl ^9.4.0`
-  - `espressif/usb *`
   - `skuodi/libssh2_esp ^1.1.0`
 
 ## Build, Flash, and Monitor
@@ -264,13 +306,13 @@ Use this flow:
 export IDF_PATH="$HOME/projects/esp-idf"
 . "$IDF_PATH/export.sh"
 idf.py build
-idf.py -p /dev/ttyACM1 flash
+idf.py -p /dev/ttyACM0 flash
 ```
 
 Optional monitor:
 
 ```bash
-idf.py -p /dev/ttyACM1 monitor
+idf.py -p /dev/ttyACM0 monitor
 ```
 
 ESP32-P4 bring-up note (important):
@@ -286,9 +328,9 @@ ESP32-P4 bring-up note (important):
 ## Known-Good Baseline
 
 - LazyVim main screen currently loads correctly.
-- Keep terminal geometry at `100 x 32`, cell size `8 x 15`.
+- Terminal geometry is computed from display resolution using cell `8 x 15`.
 - Keep Cozette primary + LVGL fallback flow.
-- Firmware builds and flashes successfully to `/dev/ttyACM1`.
+- Firmware builds and flashes successfully to `/dev/ttyACM0`.
 
 ## Known Quirks and Operational Notes
 
@@ -304,11 +346,16 @@ ESP32-P4 bring-up note (important):
    - Reproduced with both `TERM=xterm` and `TERM=xterm-256color` using `nvim --clean`.
    - Detailed attempt history and rollback notes are tracked in `SPEC.md`.
 
-2. Nerd Font gaps
+2. SSH host key compatibility gap
+   - Current client build lacks `ssh-ed25519` host key support.
+   - ed25519-only servers fail at handshake.
+   - Highest-priority item in phased SSH roadmap.
+
+3. Nerd Font gaps
    - Missing codepoints may still appear in future runs.
    - Add exact new `U+....` values to symbol font range as observed.
 
-3. DCS parser regression risk
+4. DCS parser regression risk
    - Prior XTGETTCAP DCS state-machine experiment regressed LazyVim rendering and was reverted.
 
 ## Regressions to Avoid

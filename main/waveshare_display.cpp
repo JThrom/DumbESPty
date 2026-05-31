@@ -130,3 +130,11 @@ esp_err_t waveshare_display_init(lv_display_t **out_disp) {
     ESP_LOGI(TAG, "Display 800x480 init ok");
     return ESP_OK;
 }
+
+int waveshare_display_width(void) {
+    return W;
+}
+
+int waveshare_display_height(void) {
+    return H;
+}

@@ -1,6 +1,7 @@
 #include "ssh_client.hpp"
 #include "shell.hpp"
 #include "wifi_mgr.hpp"
+#include "tailscale_mgr.hpp"
 #include "terminal.hpp"
 
 #include "esp_log.h"
@@ -50,10 +51,18 @@ static int s_rx_trace_budget = 160;
 static uint8_t s_rx_prev_tail = 0;
 static int s_rx_loop_budget = 120;
 static int s_queue_drain_budget = 80;
+static bool s_last_connect_requires_password = false;
+static const char *s_kbdint_password = NULL;
+
+bool ssh_last_connect_requires_password(void) {
+    return s_last_connect_requires_password;
+}
 
 static size_t filter_and_reply_fast_queries(const char *src, size_t len, char *dst);
 static void log_rx_trace(const char *data, size_t len);
 static void log_ssh_runtime_error_context(const char *where, int rc);
+static bool session_supports_alg(LIBSSH2_SESSION *sess, int method_type, const char *alg);
+static void log_supported_hostkey_algs(LIBSSH2_SESSION *sess);
 
 static void ssh_handle_rx_bytes(const char *src, size_t len) {
     size_t offset = 0;
@@ -137,6 +146,44 @@ static void log_supported_algs(LIBSSH2_SESSION *sess, int method_type, const cha
     libssh2_free(sess, (void *)algs);
 }
 #endif
+
+static bool session_supports_alg(LIBSSH2_SESSION *sess, int method_type, const char *alg) {
+    if (!sess || !alg || !alg[0]) return false;
+    const char **algs = NULL;
+    int n = libssh2_session_supported_algs(sess, method_type, &algs);
+    bool found = false;
+    if (n > 0 && algs) {
+        for (int i = 0; i < n; i++) {
+            if (algs[i] && strcmp(algs[i], alg) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if (algs) {
+        libssh2_free(sess, (void *)algs);
+    }
+    return found;
+}
+
+static void log_supported_hostkey_algs(LIBSSH2_SESSION *sess) {
+    if (!sess) return;
+    const char **algs = NULL;
+    int n = libssh2_session_supported_algs(sess, LIBSSH2_METHOD_HOSTKEY, &algs);
+    if (n < 0 || !algs) {
+        ESP_LOGW(TAG, "Unable to enumerate client hostkey algorithms");
+        return;
+    }
+
+    char buf[256];
+    int p = snprintf(buf, sizeof(buf), "Client hostkey algorithms:");
+    for (int i = 0; i < n; i++) {
+        p += snprintf(buf + p, sizeof(buf) - p, "%s%s", (i == 0 ? " " : ","), algs[i]);
+        if (p >= (int)sizeof(buf) - 24) break;
+    }
+    ESP_LOGI(TAG, "%s", buf);
+    libssh2_free(sess, (void *)algs);
+}
 
 static QueueHandle_t create_rx_queue_with_fallback(void) {
     size_t static_bytes = SSH_RX_QUEUE_SIZE * sizeof(ssh_rx_msg_t);
@@ -377,6 +424,87 @@ static int ssh_userauth_with_timeout(const char *user, const char *pass, int tim
     return LIBSSH2_ERROR_TIMEOUT;
 }
 
+LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_cb) {
+    (void)name;
+    (void)name_len;
+    (void)instruction;
+    (void)instruction_len;
+    (void)abstract;
+
+    for (int i = 0; i < num_prompts; i++) {
+        responses[i].text = NULL;
+        responses[i].length = 0;
+        if (!s_kbdint_password) continue;
+
+        const char *prompt = prompts[i].text ? (const char *)prompts[i].text : "";
+        bool is_password_prompt = strstr(prompt, "Password") || strstr(prompt, "password");
+        if (!is_password_prompt && prompts[i].echo != 0) continue;
+
+        size_t n = strlen(s_kbdint_password);
+        char *buf = (char *)malloc(n + 1);
+        if (!buf) continue;
+        memcpy(buf, s_kbdint_password, n + 1);
+        responses[i].text = buf;
+        responses[i].length = (unsigned int)n;
+    }
+}
+
+static int ssh_userauth_kbdint_with_timeout(const char *user, const char *pass, int timeout_ms) {
+    s_kbdint_password = pass;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int rc = libssh2_userauth_keyboard_interactive(session, user, &ssh_kbdint_cb);
+        if (rc == 0) {
+            s_kbdint_password = NULL;
+            return 0;
+        }
+        if (rc == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        s_kbdint_password = NULL;
+        return rc;
+    }
+    s_kbdint_password = NULL;
+    return LIBSSH2_ERROR_TIMEOUT;
+}
+
+static bool ssh_get_auth_methods_with_timeout(const char *user,
+                                              char *out,
+                                              size_t out_len,
+                                              bool *none_succeeded,
+                                              int timeout_ms) {
+    if (!out || out_len == 0 || !none_succeeded) return false;
+    out[0] = '\0';
+    *none_succeeded = false;
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        char *methods = libssh2_userauth_list(session, user, (unsigned int)strlen(user));
+        if (methods) {
+            snprintf(out, out_len, "%s", methods);
+            return true;
+        }
+
+        if (libssh2_userauth_authenticated(session)) {
+            *none_succeeded = true;
+            return true;
+        }
+
+        int err = libssh2_session_last_errno(session);
+        if (err == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        return false;
+    }
+
+    return false;
+}
+
 static LIBSSH2_CHANNEL *ssh_channel_open_with_timeout(int timeout_ms) {
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     while (xTaskGetTickCount() < deadline) {
@@ -458,7 +586,11 @@ static bool set_socket_blocking_mode(int fd, bool blocking) {
     return fcntl(fd, F_SETFL, flags) == 0;
 }
 
-static bool tcp_connect_with_retry(const struct sockaddr_in *saddr) {
+static bool is_tailnet_ipv4(uint32_t ip_host_order) {
+    return (ip_host_order & 0xFFC00000u) == 0x64400000u;  // 100.64.0.0/10
+}
+
+static bool tcp_connect_with_retry(const struct sockaddr_in *saddr, uint32_t bind_ip_host_order) {
     for (int attempt = 1; attempt <= SSH_CONNECT_RETRIES; attempt++) {
         ssh_sock = socket(AF_INET, SOCK_STREAM, 0);
         if (ssh_sock < 0) {
@@ -472,6 +604,21 @@ static bool tcp_connect_with_retry(const struct sockaddr_in *saddr) {
             close(ssh_sock);
             ssh_sock = -1;
             continue;
+        }
+
+        if (bind_ip_host_order != 0) {
+            struct sockaddr_in src;
+            memset(&src, 0, sizeof(src));
+            src.sin_family = AF_INET;
+            src.sin_port = 0;
+            src.sin_addr.s_addr = htonl(bind_ip_host_order);
+            if (bind(ssh_sock, (const struct sockaddr *)&src, sizeof(src)) != 0) {
+                ESP_LOGW(TAG,
+                         "bind() to VPN IP failed on attempt %d: errno=%d %s",
+                         attempt,
+                         errno,
+                         strerror(errno));
+            }
         }
 
         TickType_t t0 = xTaskGetTickCount();
@@ -569,6 +716,8 @@ static void ssh_recv_task(void *param) {
 #endif
 
 bool ssh_connect(const char *host, uint16_t port, const char *user, const char *pass) {
+    s_last_connect_requires_password = false;
+
     if (ssh_connected) {
         ESP_LOGW(TAG, "Already connected");
         return false;
@@ -602,9 +751,21 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     }
     memcpy(&saddr.sin_addr, he->h_addr, he->h_length);
     ESP_LOGI(TAG, "Resolved %s to %s", host, inet_ntoa(saddr.sin_addr));
+    uint32_t bind_ip = 0;
+    uint32_t dest_ip = ntohl(saddr.sin_addr.s_addr);
+    if (tailscale_mgr_is_connected() && is_tailnet_ipv4(dest_ip)) {
+        bind_ip = tailscale_mgr_get_vpn_ip();
+        if (bind_ip != 0) {
+            struct in_addr bind_addr = {.s_addr = htonl(bind_ip)};
+            ESP_LOGI(TAG, "Tailnet destination detected; binding source to VPN IP %s", inet_ntoa(bind_addr));
+        } else {
+            ESP_LOGW(TAG, "Tailnet destination detected but VPN IP unavailable");
+        }
+    }
+
     ESP_LOGI(TAG, "Connecting TCP to %s:%d...", host, port);
 
-    if (!tcp_connect_with_retry(&saddr)) {
+    if (!tcp_connect_with_retry(&saddr, bind_ip)) {
         ESP_LOGE(TAG, "TCP connect failed: errno=%d %s", errno, strerror(errno));
         int so_error = 0;
         socklen_t optlen = sizeof(so_error);
@@ -656,6 +817,10 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
             return false;
         }
 
+        if (hs_try == 1) {
+            log_supported_hostkey_algs(session);
+        }
+
 #if SSH_VERBOSE_LOGS
         s_ssh_trace_budget = 1200;
         libssh2_trace_sethandler(session, NULL, ssh_trace_handler);
@@ -668,20 +833,26 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         libssh2_trace(session, 0);
 #endif
 
-        /* Prefer conservative algorithms on ESP32 to avoid intermittent
-         * failures seen with chacha20-poly1305 in some libssh2/mbedTLS mixes. */
-        libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_CS,
-                                    "aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr");
-        libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_SC,
-                                    "aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr");
-        libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_CS,
-                                    "hmac-sha1,hmac-sha2-256,hmac-sha2-512");
-        libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_SC,
-                                    "hmac-sha1,hmac-sha2-256,hmac-sha2-512");
-        libssh2_session_method_pref(session, LIBSSH2_METHOD_KEX,
-                                    "ecdh-sha2-nistp256,diffie-hellman-group14-sha256");
-        libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY,
-                                    "ecdsa-sha2-nistp256,ssh-ed25519");
+        const bool use_conservative_profile = (hs_try == 1);
+        if (use_conservative_profile) {
+            /* First try a conservative profile that has been stable on ESP.
+             * If handshake still fails, retries fall back to libssh2 defaults. */
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_CS,
+                                        "aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_SC,
+                                        "aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_CS,
+                                        "hmac-sha1,hmac-sha2-256,hmac-sha2-512");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_SC,
+                                        "hmac-sha1,hmac-sha2-256,hmac-sha2-512");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_KEX,
+                                        "ecdh-sha2-nistp256,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY,
+                                        "ecdsa-sha2-nistp256,ssh-ed25519");
+            ESP_LOGI(TAG, "Using conservative SSH method profile (attempt %d)", hs_try);
+        } else {
+            ESP_LOGI(TAG, "Using libssh2 default SSH method profile (attempt %d)", hs_try);
+        }
 
 #if SSH_VERBOSE_LOGS
         log_supported_algs(session, LIBSSH2_METHOD_KEX, "local KEX");
@@ -689,8 +860,6 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         log_supported_algs(session, LIBSSH2_METHOD_CRYPT_CS, "local c2s ciphers");
         log_supported_algs(session, LIBSSH2_METHOD_MAC_CS, "local c2s mac");
 #endif
-
-        ESP_LOGI(TAG, "Using libssh2 default method negotiation");
 
         libssh2_session_set_blocking(session, 1);
         libssh2_session_set_timeout(session, SSH_HANDSHAKE_TIMEOUT_MS);
@@ -703,6 +872,11 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
         log_session_error("Handshake");
         ESP_LOGE(TAG, "Handshake failed: rc=%d errno=%d %s", rc, errno, strerror(errno));
+        if (rc == LIBSSH2_ERROR_KEX_FAILURE &&
+            !session_supports_alg(session, LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519")) {
+            ESP_LOGW(TAG,
+                     "This SSH client build does not support ssh-ed25519 host keys; servers offering only ssh-ed25519 cannot be used");
+        }
 
         libssh2_session_free(session);
         session = NULL;
@@ -718,7 +892,7 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
         ESP_LOGW(TAG, "Retrying after handshake failure rc=%d", rc);
         vTaskDelay(pdMS_TO_TICKS(250));
-        if (!tcp_connect_with_retry(&saddr)) {
+        if (!tcp_connect_with_retry(&saddr, bind_ip)) {
             ESP_LOGE(TAG, "TCP reconnect failed after handshake error");
             delete_rx_queue();
             coex_release();
@@ -736,7 +910,41 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
     ESP_LOGI(TAG, "Handshake OK, authenticating...");
 
-    rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+    char auth_methods[96];
+    bool none_auth_succeeded = false;
+    bool have_auth_methods = ssh_get_auth_methods_with_timeout(user,
+                                                               auth_methods,
+                                                               sizeof(auth_methods),
+                                                               &none_auth_succeeded,
+                                                               SSH_HANDSHAKE_TIMEOUT_MS);
+    bool password_supported = have_auth_methods && strstr(auth_methods, "password");
+    bool kbdint_supported = have_auth_methods && strstr(auth_methods, "keyboard-interactive");
+
+    if (none_auth_succeeded) {
+        ESP_LOGI(TAG, "Auth OK via 'none' method");
+        rc = 0;
+    } else if (!have_auth_methods) {
+        ESP_LOGW(TAG, "Could not query auth methods; continuing with configured auth path");
+        rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+    } else if (pass && pass[0]) {
+        if (kbdint_supported) {
+            rc = ssh_userauth_kbdint_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+            if (rc != 0 && password_supported) {
+                rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+            }
+        } else {
+            rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+        }
+    } else {
+        if (password_supported || kbdint_supported) {
+            s_last_connect_requires_password = true;
+            ESP_LOGI(TAG, "Password-style auth required by server (methods: %s)", auth_methods);
+        } else {
+            ESP_LOGW(TAG, "No passwordless auth available (methods: %s)", auth_methods);
+        }
+        rc = LIBSSH2_ERROR_AUTHENTICATION_FAILED;
+    }
+
     if (rc != 0) {
         log_session_error("Auth");
         ESP_LOGE(TAG, "Auth failed: rc=%d", rc);

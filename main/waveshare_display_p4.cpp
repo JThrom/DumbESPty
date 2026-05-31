@@ -379,3 +379,11 @@ esp_err_t waveshare_display_init(lv_display_t **out_disp) {
     ESP_LOGW(TAG, "Using temporary headless 1024x600 LVGL display backend (no MIPI output yet)");
     return ESP_OK;
 }
+
+int waveshare_display_width(void) {
+    return W;
+}
+
+int waveshare_display_height(void) {
+    return H;
+}

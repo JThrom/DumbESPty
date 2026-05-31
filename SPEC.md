@@ -2,16 +2,44 @@
 
 ## Overview
 
-DumbESPty is a Waveshare 7 inch touch LCD powered by an ESP32-S3. This project is a new take on an old dumb terminal console. It combines a color terminal interface with a simple shell with an SSH client so your favorite terminal experience can go with you anywhere.  
+DumbESPty is a Waveshare 7 inch touch LCD terminal platform powered primarily by ESP32-P4 (legacy path on ESP32-S3). This project is a new take on an old dumb terminal console. It combines a color terminal interface with a simple shell and SSH client so your terminal experience can go with you anywhere.  
 
 - Wi-Fi station connectivity
 - BLE HID keyboard input
 - VT100/xterm-style color terminal emulation rendered to LVGL canvas
 - SSHv2 client transport via libssh2
 
-Primary integration objective in this phase is compatibility with modern
-`zsh`/`oh-my-zsh` and `neovim`/LazyVim terminal expectations while preserving
-rendering stability.
+Primary integration objective in this phase is Linux-like SSH client
+compatibility across mixed server/auth configurations while preserving
+LazyVim rendering stability.
+
+## Current Status
+
+- Active hardware target for current work: ESP32-P4-WIFI6-Touch-LCD-7B.
+- Build baseline: ESP-IDF 6.1.
+- Terminal geometry derives from display resolution at runtime.
+  - P4 baseline: `1024x600` -> `128x40` grid at cell `8x15`.
+- Shell SSH parser supports both:
+  - `ssh host[:port]`
+  - `ssh user@host[:port]`
+- SSH auth behavior probes first, then uses `none` / `keyboard-interactive` /
+  `password` paths as available.
+- High-priority gap: current client build does not support `ssh-ed25519`
+  host keys, so ed25519-only servers fail during handshake.
+
+## SSH Compatibility Roadmap (Phased)
+
+1. Phase 1: host key compatibility
+   - Add client support for `ssh-ed25519` host keys.
+2. Phase 2: auth method coverage
+   - Ensure robust `publickey`, `keyboard-interactive`, `password`, `none`
+     negotiation behavior.
+3. Phase 3: key management
+   - Add vault-backed private-key import/storage and passphrase support.
+4. Phase 4: host trust model
+   - Add `known_hosts`-style fingerprint pinning and mismatch protections.
+5. Phase 5: compatibility polish
+   - Improve defaults/fallbacks and diagnostics to match Linux SSH behavior.
 
 ## Runtime Architecture
 
@@ -62,7 +90,7 @@ Compatibility implemented for active editor/shell scenarios:
 Rendering notes:
 - Uses Cozette bitmap font with LVGL fallback font path
 - Private-use codepoints (Nerd icon ranges) skip Cozette bitmap lookup so Nerd symbol glyphs render consistently
-- Fixed grid target currently tuned for compact editor use (`100x32`, `8x15`)
+- Grid is derived from active display resolution using `8x15` cells
 - Icon fallback remaps currently include `U+F426`, `U+E348`, `U+F0B37`, `U+F12B7`, and `U+F1064` to `U+F15B`
 
 ### SSH Client (`main/ssh_client.cpp`, `main/ssh_client.hpp`)
@@ -83,12 +111,14 @@ Stability hardening:
   - corrected cipher direction handling,
   - corrected mbedTLS v3 HMAC setup flow
 - strict-KEX handling corrected to avoid unilateral sequence resets after NEWKEYS
+- auth flow includes method probe and keyboard-interactive fallback
+- current high-priority limitation: no `ssh-ed25519` host key support in this build
 
 ### Shell (`main/shell.cpp`, `main/shell.hpp`)
 
 - Local command processing (`help`, `wifi`, `ssh`, etc.)
 - SSH passthrough mode toggling
-- Password capture callback support
+- Password capture callback support (deferred until required by auth probe)
 - Escape/arrow/backspace handling integrated with terminal write path
 
 ### BLE HID Host (`main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`)
@@ -136,7 +166,7 @@ previously missing LazyVim glyphs:
 ## Build, Flash, and Target
 
 Target board connection:
-- serial port: `/dev/ttyACM1`
+- serial port: `/dev/ttyACM0`
 
 Typical cycle:
 
@@ -144,12 +174,31 @@ Typical cycle:
 export IDF_PATH="$HOME/projects/esp-idf"
 . "$IDF_PATH/export.sh"
 idf.py build
-idf.py -p /dev/ttyACM1 flash
+idf.py -p /dev/ttyACM0 flash
 ```
 
 ## Current Bug Worklist
 
-### 0) SSH handshake/auth regression (resolved in this cycle)
+### 0) SSH host key compatibility gap (highest priority, open)
+
+Observed:
+- servers offering only `ssh-ed25519` host key fail at handshake with:
+  - `session_handshake rc=-5`
+  - `Unable to exchange encryption keys`
+
+Current diagnostics confirm:
+- client hostkey algorithm list currently includes ECDSA/RSA variants only.
+- `ssh-ed25519` is not advertised by this build.
+
+Current status:
+- open.
+
+Planned next steps:
+1. enable `ssh-ed25519` host key support in client stack (Phase 1 roadmap)
+2. re-test against ed25519-only hosts and mixed-hostkey hosts
+3. keep ECDSA/RSA fallback compatibility
+
+### 0.1) SSH handshake/auth regression (resolved in prior cycle)
 
 Previously observed:
 - handshake stalled/failure after NEWKEYS while waiting for `SERVICE_ACCEPT`
@@ -163,7 +212,7 @@ Resolution summary:
 Current status:
 - resolved for current baseline.
 
-### 0.1) SSH immediate post-connect `rc=-4` regression (resolved)
+### 0.2) SSH immediate post-connect `rc=-4` regression (resolved)
 
 Observed in recent iterations:
 - session disconnected almost immediately with:
@@ -271,7 +320,7 @@ Planned next steps:
 
 - LazyVim main screen loads after DCS rollback.
 - Updated Nerd symbol font includes the three known missing glyphs.
-- Firmware builds and flashes successfully to `/dev/ttyACM1`.
+- Firmware builds and flashes successfully to `/dev/ttyACM0`.
 
 ## Known Quirks and Workarounds
 

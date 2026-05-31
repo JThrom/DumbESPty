@@ -770,3 +770,35 @@ uint32_t microlink_resolve(const microlink_t *ml, const char *hostname) {
 
     return 0;  /* Not found */
 }
+
+esp_err_t microlink_probe_peer(microlink_t *ml, uint32_t dest_vpn_ip,
+                               uint32_t timeout_ms, bool *tunnel_up) {
+    if (!ml || dest_vpn_ip == 0) return ESP_ERR_INVALID_ARG;
+    if (ml->state != ML_STATE_CONNECTED) return ESP_ERR_INVALID_STATE;
+
+    bool found = false;
+    for (int i = 0; i < ml->peer_count; i++) {
+        if (ml->peers[i].active && ml->peers[i].vpn_ip == dest_vpn_ip) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return ESP_ERR_NOT_FOUND;
+
+    ml_wg_mgr_trigger_handshake(ml, dest_vpn_ip);
+    ml_wg_mgr_send_cmm(ml, dest_vpn_ip);
+
+    uint32_t max_wait = timeout_ms ? timeout_ms : 3000;
+    uint32_t elapsed = 0;
+    bool up = ml_wg_mgr_peer_is_up(ml, dest_vpn_ip);
+    while (!up && elapsed < max_wait) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        elapsed += 200;
+        up = ml_wg_mgr_peer_is_up(ml, dest_vpn_ip);
+    }
+
+    if (tunnel_up) {
+        *tunnel_up = up;
+    }
+    return ESP_OK;
+}

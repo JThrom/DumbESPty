@@ -20,6 +20,7 @@ bool tailscale_mgr_is_enabled(void);
 bool tailscale_mgr_is_connected(void);
 bool tailscale_mgr_is_connecting(void);
 const char *tailscale_mgr_backend_name(void);
+uint32_t tailscale_mgr_get_vpn_ip(void);
 void tailscale_mgr_get_status_line(char *buf, size_t len);
 
 void cmd_tailscale(int argc, char **argv);

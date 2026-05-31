@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -38,6 +39,7 @@ typedef enum {
     TS_PENDING_NONE = 0,
     TS_PENDING_SET_AUTHKEY,
     TS_PENDING_SET_TOKEN,
+    TS_PENDING_SHOW_SECRET,
     TS_PENDING_SET_SECRET_SETUP_VAULT,
     TS_PENDING_SET_SECRET_SETUP_VAULT_CONFIRM,
     TS_PENDING_SET_SECRET_STORE,
@@ -74,6 +76,23 @@ static char s_pending_secret[256] = "";
 static char s_pending_vault_pass[128] = "";
 static const char *s_pending_secret_key = NULL;
 static const char *TAG = "tailscale";
+
+static void copy_trimmed_secret(char *dst, size_t dst_len, const char *src) {
+    if (!dst || dst_len == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    const char *start = src;
+    while (*start && isspace((unsigned char)*start)) start++;
+
+    const char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+
+    size_t n = (size_t)(end - start);
+    if (n >= dst_len) n = dst_len - 1;
+    memcpy(dst, start, n);
+    dst[n] = '\0';
+}
 
 static void ts_println(const char *msg) {
     shell_print("\r\n  ");
@@ -207,7 +226,10 @@ static esp_err_t ts_start_with_authkey(const char *authkey, bool print_messages)
 
     ts_stop_session("restart-before-up");
 
-    snprintf(s_runtime_authkey, sizeof(s_runtime_authkey), "%s", authkey);
+    copy_trimmed_secret(s_runtime_authkey, sizeof(s_runtime_authkey), authkey);
+    if (!s_runtime_authkey[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     microlink_config_t cfg = {};
     cfg.auth_key = s_runtime_authkey;
@@ -275,6 +297,73 @@ static void ts_print_peer_list(void) {
                  info.direct_path ? "direct" : "derp");
         ts_println(line);
     }
+}
+
+static int ts_find_peer_index_by_ip(uint32_t ip) {
+    if (!s_ml || ip == 0) return -1;
+    const int count = microlink_get_peer_count(s_ml);
+    for (int i = 0; i < count; i++) {
+        microlink_peer_info_t info = {};
+        if (microlink_get_peer_info(s_ml, i, &info) != ESP_OK) continue;
+        if (info.vpn_ip == ip) return i;
+    }
+    return -1;
+}
+
+static void ts_ping_peer(const char *target) {
+    if (!target || !target[0]) {
+        ts_println("usage: tailscale ping <hostname|ip>");
+        return;
+    }
+    if (!s_ml || !tailscale_mgr_is_connected()) {
+        ts_println("tailscale not connected");
+        return;
+    }
+
+    uint32_t ip = microlink_parse_ip(target);
+    if (ip == 0) {
+        ip = microlink_resolve(s_ml, target);
+    }
+    if (ip == 0) {
+        ts_println("peer not found in tailnet map");
+        return;
+    }
+
+    char ip_str[16] = {0};
+    microlink_ip_to_str(ip, ip_str);
+    shell_print("\r\n  ping target ");
+    shell_print(target);
+    shell_print(" -> ");
+    shell_print(ip_str);
+    shell_print("\r\n");
+
+    bool tunnel_up = false;
+    esp_err_t err = microlink_probe_peer(s_ml, ip, 3000, &tunnel_up);
+    if (err != ESP_OK) {
+        ts_print_err("probe failed", err);
+        return;
+    }
+
+    int idx = ts_find_peer_index_by_ip(ip);
+    if (idx >= 0) {
+        microlink_peer_info_t info = {};
+        if (microlink_get_peer_info(s_ml, idx, &info) == ESP_OK) {
+            shell_print("  peer: ");
+            shell_print(info.hostname[0] ? info.hostname : "(unnamed)");
+            shell_print(" online=");
+            shell_print(info.online ? "1" : "0");
+            shell_print(" direct=");
+            shell_print(info.direct_path ? "1" : "0");
+            shell_print(" tunnel_up=");
+            shell_print(tunnel_up ? "1" : "0");
+            shell_print("\r\n");
+            return;
+        }
+    }
+
+    shell_print("  tunnel_up=");
+    shell_print(tunnel_up ? "1" : "0");
+    shell_print("\r\n");
 }
 
 static void ts_on_crypt_pass(const char *crypt_pass) {
@@ -361,6 +450,27 @@ static void ts_on_crypt_pass(const char *crypt_pass) {
         goto done;
     }
 
+    if (s_pending == TS_PENDING_SHOW_SECRET) {
+        if (!s_pending_secret_key) {
+            ts_println("no secret key selected");
+            goto done;
+        }
+
+        esp_err_t err = secret_vault_load(s_pending_secret_key, crypt_pass, secret, sizeof(secret));
+        if (err != ESP_OK) {
+            s_secret_load_fail++;
+            ts_println("invalid vault password or missing secret");
+            goto done;
+        }
+
+        s_secret_load_ok++;
+        shell_print("\r\n  ");
+        shell_print(s_pending_secret_key == TS_SECRET_AUTHKEY ? "authkey: " : "token: ");
+        shell_print(secret);
+        shell_print("\r\n");
+        goto done;
+    }
+
 done:
     memset(secret, 0, sizeof(secret));
     memset(s_pending_secret, 0, sizeof(s_pending_secret));
@@ -371,10 +481,10 @@ done:
 
 static void ts_on_input(const char *value) {
     if (s_pending == TS_PENDING_SET_AUTHKEY) {
-        snprintf(s_pending_secret, sizeof(s_pending_secret), "%s", value);
+        copy_trimmed_secret(s_pending_secret, sizeof(s_pending_secret), value);
         s_pending_secret_key = TS_SECRET_AUTHKEY;
     } else if (s_pending == TS_PENDING_SET_TOKEN) {
-        snprintf(s_pending_secret, sizeof(s_pending_secret), "%s", value);
+        copy_trimmed_secret(s_pending_secret, sizeof(s_pending_secret), value);
         s_pending_secret_key = token_key_for_backend();
     } else {
         s_pending = TS_PENDING_NONE;
@@ -447,6 +557,11 @@ bool tailscale_mgr_is_connecting(void) {
     return s_connecting;
 }
 
+uint32_t tailscale_mgr_get_vpn_ip(void) {
+    if (!s_ml) return 0;
+    return microlink_get_vpn_ip(s_ml);
+}
+
 const char *tailscale_mgr_backend_name(void) {
     return s_cfg.backend == TS_BACKEND_SAAS ? "saas" : "headscale";
 }
@@ -508,7 +623,7 @@ void tailscale_mgr_get_status_line(char *buf, size_t len) {
 
 void cmd_tailscale(int argc, char **argv) {
     if (argc < 2) {
-        shell_print("\r\n  usage: tailscale enable|disable|backend [saas|headscale]|set tailnet <name>|set control-url <url>|set authkey|set token|up|down|status|devices|clear");
+        shell_print("\r\n  usage: tailscale enable|disable|backend [saas|headscale]|set tailnet <name>|set control-url <url>|set authkey|set token|show authkey|show token|ping <hostname|ip>|up|down|status|devices|clear");
         shell_print("\r\n  defaults: backend (");
         shell_print(tailscale_mgr_backend_name());
         shell_print(")");
@@ -629,6 +744,28 @@ void cmd_tailscale(int argc, char **argv) {
         return;
     }
 
+    if (strcmp(argv[1], "show") == 0) {
+        if (argc < 3) {
+            shell_print("\r\n  usage: tailscale show authkey|token\r\n");
+            return;
+        }
+
+        if (strcmp(argv[2], "authkey") == 0) {
+            s_pending = TS_PENDING_SHOW_SECRET;
+            s_pending_secret_key = TS_SECRET_AUTHKEY;
+        } else if (strcmp(argv[2], "token") == 0) {
+            s_pending = TS_PENDING_SHOW_SECRET;
+            s_pending_secret_key = token_key_for_backend();
+        } else {
+            shell_print("\r\n  usage: tailscale show authkey|token\r\n");
+            return;
+        }
+
+        shell_print("\r\n  Vault password: ");
+        shell_get_hidden_input(ts_on_crypt_pass);
+        return;
+    }
+
     if (strcmp(argv[1], "up") == 0) {
         s_pending = TS_PENDING_UP_VAULT;
         shell_print("\r\n  Vault password: ");
@@ -661,6 +798,15 @@ void cmd_tailscale(int argc, char **argv) {
 
     if (strcmp(argv[1], "devices") == 0) {
         ts_print_peer_list();
+        return;
+    }
+
+    if (strcmp(argv[1], "ping") == 0) {
+        if (argc < 3) {
+            ts_println("usage: tailscale ping <hostname|ip>");
+            return;
+        }
+        ts_ping_peer(argv[2]);
         return;
     }
 

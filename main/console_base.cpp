@@ -103,11 +103,20 @@ extern "C" void app_main(void) {
     extern const lv_font_t lv_font_nerd_symbols_10;
     extern const cozette_bdf_font_t g_cozette_bdf_13;
 
+    const int cell_w = 8;
+    const int cell_h = 15;
+    int cols = waveshare_display_width() / cell_w;
+    int rows = waveshare_display_height() / cell_h;
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+    if (cols > TERM_MAX_COLS) cols = TERM_MAX_COLS;
+    if (rows > TERM_MAX_ROWS) rows = TERM_MAX_ROWS;
+
     terminal_init(&terminal,
-                  100,
-                  32,
-                  8,
-                  15,
+                  cols,
+                  rows,
+                  cell_w,
+                  cell_h,
                   lv_scr_act(),
                   &g_cozette_bdf_13,
                   &lv_font_term_mono_10,

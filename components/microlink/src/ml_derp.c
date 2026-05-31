@@ -33,6 +33,12 @@
 
 static const char *TAG = "ml_derp";
 
+static int ml_derp_tls_rng(void *ctx, unsigned char *out, size_t len) {
+    (void)ctx;
+    esp_fill_random(out, len);
+    return 0;
+}
+
 /* Timeout for DERP connection handshake operations */
 #define DERP_CONNECT_TIMEOUT_MS  10000
 
@@ -728,6 +734,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
 
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_read_timeout(&ml->derp.ssl_conf, DERP_CONNECT_TIMEOUT_MS);
+    mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, ml_derp_tls_rng, NULL);
 
     ret = mbedtls_ssl_setup(&ml->derp.ssl, &ml->derp.ssl_conf);
     if (ret != 0) {

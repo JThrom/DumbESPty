@@ -231,6 +231,17 @@ const char *microlink_imei_device_name(void);
  */
 uint32_t microlink_resolve(const microlink_t *ml, const char *hostname);
 
+/**
+ * @brief Trigger peer connectivity probes and wait for WG tunnel state
+ * @param ml Handle
+ * @param dest_vpn_ip Peer VPN IP in host byte order
+ * @param timeout_ms Max wait for tunnel-up status (0 => 3000ms)
+ * @param tunnel_up Output flag for tunnel status (optional)
+ * @return ESP_OK on probe attempt, ESP_ERR_NOT_FOUND if peer missing
+ */
+esp_err_t microlink_probe_peer(microlink_t *ml, uint32_t dest_vpn_ip,
+                               uint32_t timeout_ms, bool *tunnel_up);
+
 /* ============================================================================
  * UDP Socket API
  *

@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 bool ssh_connect(const char *host, uint16_t port, const char *user, const char *pass);
+bool ssh_last_connect_requires_password(void);
 void ssh_disconnect(void);
 bool ssh_is_connected(void);
 int ssh_write(const char *data, int len);

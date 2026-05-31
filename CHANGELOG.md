@@ -4,6 +4,22 @@ All notable changes to DumbESPty are documented in this file.
 
 ## [Unreleased]
 
+### Added (SSH)
+- SSH auth method probing now runs before prompting for credentials.
+- Keyboard-interactive authentication fallback support was added.
+- SSH diagnostics now log supported client hostkey algorithms and explicit
+  warning when `ssh-ed25519` host keys are unavailable in current build.
+
+### Changed (Shell/UI)
+- `ssh` command now accepts both `ssh [user@]host[:port]` forms.
+- `about` command display line now reports live terminal geometry and cell size.
+- Terminal grid sizing now derives from active display resolution instead of
+  fixed `100x32`.
+
+### Documentation
+- Updated `README.md`, `SPEC.md`, and `AGENTS.md` for current ESP32-P4 status,
+  active serial port, and phased SSH compatibility roadmap.
+
 ### Added (UI/Terminal)
 - Local credential/system managers and shell integration modules:
   - `hostname_mgr`

@@ -462,17 +462,37 @@ static void cmd_about_handler(int argc, char **argv) {
 
     shell_print("\r\n\033[48;2;30;20;44m\033[38;2;255;212;120m  DEVICE\033[0m");
     const esp_app_desc_t *app_desc = esp_app_get_description();
+    #if CONFIG_IDF_TARGET_ESP32P4
+    shell_print("\r\n\033[38;2;255;212;120m    Product:\033[0m Waveshare ESP32-P4-WIFI6-Touch-LCD-7B");
+    #else
     shell_print("\r\n\033[38;2;255;212;120m    Product:\033[0m Waveshare ESP32-S3-Touch-LCD-7");
+    #endif
     shell_print("\r\n\033[38;2;255;212;120m    DumbESPty version:\033[0m ");
     shell_print(app_desc->version);
     shell_print("\r\n\033[38;2;255;212;120m    Author:\033[0m Jason Throm");
     shell_print("\r\n\033[38;2;255;212;120m    GitHub:\033[0m https://github.com/JThrom/DumbESPty");
     shell_print("\r\n\033[38;2;255;212;120m    License:\033[0m GNU/GPL v2");
-    shell_print("\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel, terminal grid 100 x 32, cell 8 x 15");
+    if (term) {
+        char display_line[128];
+        snprintf(display_line,
+                 sizeof(display_line),
+                 "\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel, terminal grid %d x %d, cell %d x %d",
+                 term->cols,
+                 term->rows,
+                 term->font_w,
+                 term->font_h);
+        shell_print(display_line);
+    } else {
+        shell_print("\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel");
+    }
     shell_print("\r\n\033[38;2;255;212;120m    Controller helper:\033[0m CH422G I2C expander init path enabled");
 
     shell_print("\r\n\r\n\033[48;2;16;36;72m\033[38;2;130;220;255m  MCU + SDK\033[0m");
+    #if CONFIG_IDF_TARGET_ESP32P4
+    shell_print("\r\n\033[38;2;130;220;255m    MCU:\033[0m Espressif ESP32-P4 (dual-core + LP core, Wi-Fi 6 companion + BLE path)");
+    #else
     shell_print("\r\n\033[38;2;130;220;255m    MCU:\033[0m Espressif ESP32-S3 (dual-core Xtensa LX7, Wi-Fi + BLE)");
+    #endif
     shell_print("\r\n\033[38;2;130;220;255m    ESP-IDF:\033[0m ");
     shell_print(esp_get_idf_version());
     shell_print("\r\n\033[38;2;130;220;255m    FreeRTOS:\033[0m ");
@@ -494,17 +514,54 @@ static void cmd_about_handler(int argc, char **argv) {
 
 static char ssh_host[64];
 static uint16_t ssh_port;
-static char ssh_user[32];
+static char ssh_user[32] = "root";
 
 typedef struct {
     char host[64];
     uint16_t port;
     char user[32];
     char pass[INPUT_BUF_SIZE];
+    bool allow_password_prompt;
 } ssh_connect_ctx_t;
 
 static TaskHandle_t ssh_connect_worker_handle = NULL;
 static ssh_connect_ctx_t *ssh_connect_ctx_pending = NULL;
+
+static void ssh_password_cb(const char *pass);
+static bool ensure_ssh_connect_worker(void);
+
+static bool queue_ssh_connect(const char *pass, bool allow_password_prompt) {
+    if (ssh_connect_pending) {
+        shell_print("\r\n  SSH connect already in progress");
+        return false;
+    }
+
+    ssh_connect_ctx_t *ctx = (ssh_connect_ctx_t *)malloc(sizeof(ssh_connect_ctx_t));
+    if (!ctx) {
+        shell_print("\r\n  SSH connect alloc failed");
+        return false;
+    }
+
+    snprintf(ctx->host, sizeof(ctx->host), "%s", ssh_host);
+    ctx->port = ssh_port;
+    snprintf(ctx->user, sizeof(ctx->user), "%s", ssh_user);
+    snprintf(ctx->pass, sizeof(ctx->pass), "%s", pass ? pass : "");
+    ctx->allow_password_prompt = allow_password_prompt;
+
+    ssh_connect_pending = true;
+    shell_print("\r\n  Connecting...");
+
+    if (!ensure_ssh_connect_worker()) {
+        ssh_connect_pending = false;
+        shell_print("\r\n  SSH worker task create failed");
+        free(ctx);
+        return false;
+    }
+
+    ssh_connect_ctx_pending = ctx;
+    xTaskNotifyGive(ssh_connect_worker_handle);
+    return true;
+}
 
 static void ssh_connect_worker_task(void *param) {
     (void)param;
@@ -521,6 +578,9 @@ static void ssh_connect_worker_task(void *param) {
         bool ok = ssh_connect(ctx->host, ctx->port, ctx->user, ctx->pass);
         if (ok) {
             shell_set_ssh_active(true);
+        } else if (ctx->allow_password_prompt && ssh_last_connect_requires_password()) {
+            shell_print("\r\n  Password: ");
+            shell_get_hidden_input(ssh_password_cb);
         } else {
             shell_print("\r\n  SSH connection failed");
             if (!ssh_active) prompt(true);
@@ -566,39 +626,12 @@ static bool ensure_ssh_connect_worker(void) {
 }
 
 static void ssh_password_cb(const char *pass) {
-    if (ssh_connect_pending) {
-        shell_print("\r\n  SSH connect already in progress");
-        return;
-    }
-
-    ssh_connect_ctx_t *ctx = (ssh_connect_ctx_t *)malloc(sizeof(ssh_connect_ctx_t));
-    if (!ctx) {
-        shell_print("\r\n  SSH connect alloc failed");
-        return;
-    }
-
-    snprintf(ctx->host, sizeof(ctx->host), "%s", ssh_host);
-    ctx->port = ssh_port;
-    snprintf(ctx->user, sizeof(ctx->user), "%s", ssh_user);
-    snprintf(ctx->pass, sizeof(ctx->pass), "%s", pass);
-
-    ssh_connect_pending = true;
-    shell_print("\r\n  Connecting...");
-
-    if (!ensure_ssh_connect_worker()) {
-        ssh_connect_pending = false;
-        shell_print("\r\n  SSH worker task create failed");
-        free(ctx);
-        return;
-    }
-
-    ssh_connect_ctx_pending = ctx;
-    xTaskNotifyGive(ssh_connect_worker_handle);
+    queue_ssh_connect(pass, false);
 }
 
 static void cmd_ssh_handler(int argc, char **argv) {
     if (argc < 2) {
-        shell_print("\r\n  Usage: ssh user@host[:port]");
+        shell_print("\r\n  Usage: ssh [user@]host[:port]");
         return;
     }
 
@@ -609,31 +642,56 @@ static void cmd_ssh_handler(int argc, char **argv) {
 
     const char *arg = argv[1];
     const char *at = strchr(arg, '@');
-    if (!at) {
-        shell_print("\r\n  Usage: ssh user@host[:port]");
+    const char *host_part = arg;
+
+    if (at) {
+        int user_len = at - arg;
+        if (user_len <= 0) {
+            shell_print("\r\n  Invalid SSH target");
+            return;
+        }
+        if (user_len >= (int)sizeof(ssh_user)) user_len = sizeof(ssh_user) - 1;
+        memcpy(ssh_user, arg, user_len);
+        ssh_user[user_len] = '\0';
+        host_part = at + 1;
+    } else if (ssh_user[0] == '\0') {
+        snprintf(ssh_user, sizeof(ssh_user), "%s", "root");
+    }
+
+    if (host_part[0] == '\0') {
+        shell_print("\r\n  Invalid SSH target");
         return;
     }
 
-    int user_len = at - arg;
-    if (user_len >= (int)sizeof(ssh_user)) user_len = sizeof(ssh_user) - 1;
-    memcpy(ssh_user, arg, user_len);
-    ssh_user[user_len] = '\0';
-
-    const char *host_part = at + 1;
     const char *colon = strchr(host_part, ':');
     if (colon) {
         int host_len = colon - host_part;
+        if (host_len <= 0) {
+            shell_print("\r\n  Invalid SSH host");
+            return;
+        }
         if (host_len >= (int)sizeof(ssh_host)) host_len = sizeof(ssh_host) - 1;
         memcpy(ssh_host, host_part, host_len);
         ssh_host[host_len] = '\0';
-        ssh_port = atoi(colon + 1);
+
+        const char *port_str = colon + 1;
+        if (port_str[0] == '\0') {
+            shell_print("\r\n  Invalid SSH port");
+            return;
+        }
+        char *end = NULL;
+        long parsed_port = strtol(port_str, &end, 10);
+        if (*end != '\0' || parsed_port <= 0 || parsed_port > 65535) {
+            shell_print("\r\n  Invalid SSH port");
+            return;
+        }
+        ssh_port = (uint16_t)parsed_port;
     } else {
         snprintf(ssh_host, sizeof(ssh_host), "%s", host_part);
         ssh_port = 22;
     }
 
-    shell_print("\r\n  Password: ");
-    shell_get_hidden_input(ssh_password_cb);
+    queue_ssh_connect("", true);
 }
 
 void shell_init(terminal_t *t) {
