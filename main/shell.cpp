@@ -1,16 +1,19 @@
 #include "shell.hpp"
+#include "hostname_mgr.hpp"
+#include "secret_vault.hpp"
 #include "ssh_client.hpp"
+#include "tailscale_mgr.hpp"
 #include "terminal.hpp"
 #include <cstring>
 #include <cstdio>
 #include "wifi_mgr.hpp"
-#include "ssh_client.hpp"
 #include <cstdlib>
 #include "esp_log.h"
 #include "esp_app_desc.h"
 #include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "lvgl.h"
 #include "libssh2.h"
 
@@ -18,8 +21,13 @@ static const char *TAG = "shell";
 
 #define CMD_MAX_ARGS 8
 #define CMD_TABLE_SIZE 16
-#define INPUT_BUF_SIZE 256
+#define INPUT_BUF_SIZE 2048
 #define HISTORY_SIZE 16
+#define SSH_PASS_BUF_SIZE 256
+#define SSH_KEY_MAX_LEN 4096
+
+static constexpr const char *SSH_VAULT_KEY_PRIVATE = "ssh_privkey";
+static constexpr const char *SSH_VAULT_KEY_PASSPHRASE = "ssh_keypass";
 
 typedef struct {
     const char *name;
@@ -46,9 +54,116 @@ static bool ssh_connect_pending = false;
 static bool suppress_prompt_once = false;
 static bool input_masked = false;
 
+static bool completion_active = false;
+static int completion_count = 0;
+static int completion_index = 0;
+static int completion_token_start = 0;
+static int completion_token_len = 0;
+static char completion_items[16][33];
+
 extern void cmd_help(int argc, char **argv);
 extern void cmd_wifi(int argc, char **argv);
 extern void cmd_ssh(int argc, char **argv);
+extern void cmd_tailscale(int argc, char **argv);
+extern void cmd_hostname(int argc, char **argv);
+static void sshkey_reset_pending(void);
+
+static void completion_reset(void) {
+    completion_active = false;
+    completion_count = 0;
+    completion_index = 0;
+    completion_token_start = 0;
+    completion_token_len = 0;
+}
+
+static void redraw_input_line(void) {
+    char spaces[INPUT_BUF_SIZE + 1];
+    memset(spaces, ' ', sizeof(spaces) - 1);
+    spaces[sizeof(spaces) - 1] = '\0';
+    terminal_write(term, "\r$ ", 3);
+    terminal_write(term, spaces, input_len);
+    terminal_write(term, "\r$ ", 3);
+    terminal_write(term, input_buf, input_len);
+}
+
+static int completion_collect_wifi_connect(char out[][33], int max_entries, const char *prefix) {
+    for (int i = 0; i < max_entries; i++) out[i][0] = '\0';
+    char ssids[16][33];
+    const int count = wifi_mgr_get_saved_ssids(ssids, 16);
+    int n = 0;
+    for (int i = 0; i < count && n < max_entries; i++) {
+        if (!prefix || !prefix[0] || strncmp(ssids[i], prefix, strlen(prefix)) == 0) {
+            const size_t nlen = strnlen(ssids[i], 32);
+            memcpy(out[n], ssids[i], nlen);
+            out[n][nlen] = '\0';
+            n++;
+        }
+    }
+    return n;
+}
+
+static bool completion_try_begin(void) {
+    char line[INPUT_BUF_SIZE];
+    snprintf(line, sizeof(line), "%s", input_buf);
+
+    const char *prefix_cmd = "wifi connect";
+    const size_t prefix_len = strlen(prefix_cmd);
+    if (strncmp(line, prefix_cmd, prefix_len) != 0) return false;
+    if (line[prefix_len] != '\0' && line[prefix_len] != ' ') return false;
+
+    if (line[prefix_len] == '\0') {
+        if (input_len < INPUT_BUF_SIZE - 1) {
+            input_buf[input_len++] = ' ';
+            input_buf[input_len] = '\0';
+            input_cursor = input_len;
+            snprintf(line, sizeof(line), "%s", input_buf);
+        } else {
+            return false;
+        }
+    }
+
+    completion_token_start = (int)prefix_len + 1;
+    completion_token_len = input_len - completion_token_start;
+    if (completion_token_len < 0) completion_token_len = 0;
+
+    char token_buf[33];
+    if (completion_token_len > 32) return false;
+    memcpy(token_buf, input_buf + completion_token_start, completion_token_len);
+    token_buf[completion_token_len] = '\0';
+
+    completion_count = completion_collect_wifi_connect(completion_items, 16, token_buf);
+    if (completion_count <= 0) return false;
+    completion_index = 0;
+    completion_active = completion_count > 1;
+    return true;
+}
+
+static void completion_apply_current(void) {
+    if (completion_count <= 0) return;
+    const char *choice = completion_items[completion_index];
+    const int choice_len = strlen(choice);
+    const int before_len = completion_token_start;
+    const bool need_space = (choice_len + before_len + 1) < INPUT_BUF_SIZE;
+
+    int new_len = before_len + choice_len;
+    memcpy(input_buf + completion_token_start, choice, choice_len);
+    if (need_space) input_buf[new_len++] = ' ';
+    input_buf[new_len] = '\0';
+    input_len = new_len;
+    input_cursor = new_len;
+    redraw_input_line();
+}
+
+static void completion_print_choices(void) {
+    if (completion_count <= 1) return;
+    for (int i = 0; i < completion_count; i++) {
+        shell_print("\r\n    ");
+        shell_print(i == completion_index ? "> " : "  ");
+        shell_print(completion_items[i]);
+    }
+    shell_print("\r\n");
+    redraw_input_line();
+}
 
 void shell_print(const char *text) {
     if (term) terminal_write(term, text, -1);
@@ -66,6 +181,7 @@ void shell_register_cmd(const char *name, void (*handler)(int, char **)) {
 
 void shell_get_input(void (*callback)(const char *)) {
     input_callback = callback;
+    completion_reset();
     input_masked = false;
     input_len = 0;
     input_cursor = 0;
@@ -74,6 +190,7 @@ void shell_get_input(void (*callback)(const char *)) {
 
 void shell_get_hidden_input(void (*callback)(const char *)) {
     input_callback = callback;
+    completion_reset();
     input_masked = true;
     input_len = 0;
     input_cursor = 0;
@@ -82,8 +199,7 @@ void shell_get_hidden_input(void (*callback)(const char *)) {
 
 static void execute_command(const char *line) {
     char buf[INPUT_BUF_SIZE];
-    strncpy(buf, line, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    snprintf(buf, sizeof(buf), "%s", line);
 
     char *argv[CMD_MAX_ARGS];
     int argc = 0;
@@ -128,6 +244,7 @@ static void clear_screen_and_prompt(void) {
     input_buf[0] = '\0';
     history_idx = -1;
     input_masked = false;
+    completion_reset();
 }
 
 static void prompt(bool leading_newline) {
@@ -138,6 +255,7 @@ static void prompt(bool leading_newline) {
     input_buf[0] = '\0';
     history_idx = -1;
     input_masked = false;
+    completion_reset();
 }
 
 void shell_set_ssh_active(bool active) {
@@ -153,26 +271,23 @@ bool shell_is_ssh_active(void) {
 
 void shell_handle_key(char c) {
     if (ssh_active) {
-        if (c == 0x04) {
-            ssh_disconnect();
-            shell_set_ssh_active(false);
-        } else {
-            char buf[3];
-            int n;
-            if (c == 0x1C) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'D'; n = 3; }
-            else if (c == 0x1D) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'C'; n = 3; }
-            else if (c == 0x1E) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'A'; n = 3; }
-            else if (c == 0x1F) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'B'; n = 3; }
-            else { buf[0] = c; n = 1; }
-            if ((uint8_t)c == 0x1B) {
-                ESP_LOGI(TAG, "SSH key TX: ESC");
-            }
-            ssh_write(buf, n);
+        char buf[3];
+        int n;
+        if (c == 0x1C) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'D'; n = 3; }
+        else if (c == 0x1D) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'C'; n = 3; }
+        else if (c == 0x1E) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'A'; n = 3; }
+        else if (c == 0x1F) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'B'; n = 3; }
+        else if (c == '\n' || c == '\r') { buf[0] = '\r'; n = 1; }
+        else { buf[0] = c; n = 1; }
+        if ((uint8_t)c == 0x1B) {
+            ESP_LOGI(TAG, "SSH key TX: ESC");
         }
+        ssh_write(buf, n);
         return;
     }
 
     if (c == '\b') {
+        completion_reset();
         if (input_cursor > 0) {
             terminal_write(term, "\b \b", 3);
             memmove(input_buf + input_cursor - 1, input_buf + input_cursor,
@@ -181,13 +296,16 @@ void shell_handle_key(char c) {
             input_cursor--;
         }
     } else if (c == 0x1B) {
+        completion_reset();
         input_callback = NULL;
+        sshkey_reset_pending();
         input_masked = false;
         input_len = 0;
         input_cursor = 0;
         input_buf[0] = '\0';
         prompt(true);
     } else if (c == '\n' || c == '\r') {
+        completion_reset();
         input_buf[input_len] = '\0';
         terminal_write(term, "\r\n", 2);
         if (input_len > 0 || !input_callback) {
@@ -210,6 +328,12 @@ void shell_handle_key(char c) {
             else prompt(false);
         }
     } else if (c == 0x1E) {
+        if (completion_active && completion_count > 1) {
+            completion_index = (completion_index + completion_count - 1) % completion_count;
+            completion_apply_current();
+            completion_print_choices();
+            return;
+        }
         if (history_count == 0) return;
         if (history_idx == -1) {
             strcpy(history_draft, input_buf);
@@ -237,6 +361,12 @@ void shell_handle_key(char c) {
         input_len = new_len;
         input_cursor = new_len;
     } else if (c == 0x1F) {
+        if (completion_active && completion_count > 1) {
+            completion_index = (completion_index + 1) % completion_count;
+            completion_apply_current();
+            completion_print_choices();
+            return;
+        }
         if (history_idx == -1) return;
         const char *new_text;
         int new_len;
@@ -265,16 +395,27 @@ void shell_handle_key(char c) {
         input_len = new_len;
         input_cursor = new_len;
     } else if (c == 0x1C) {
+        completion_reset();
         if (input_cursor > 0) {
             terminal_write(term, "\b", 1);
             input_cursor--;
         }
     } else if (c == 0x1D) {
+        completion_reset();
         if (input_cursor < input_len) {
             terminal_write(term, "\033[C", 3);
             input_cursor++;
         }
+    } else if (c == '\t') {
+        if (input_callback) return;
+        if (!completion_try_begin()) {
+            terminal_write(term, "\a", 1);
+            return;
+        }
+        completion_apply_current();
+        if (completion_count > 1) completion_print_choices();
     } else {
+        completion_reset();
         if (input_len < INPUT_BUF_SIZE - 1) {
             char ch = c;
             if (input_callback && input_masked) {
@@ -329,17 +470,37 @@ static void cmd_about_handler(int argc, char **argv) {
 
     shell_print("\r\n\033[48;2;30;20;44m\033[38;2;255;212;120m  DEVICE\033[0m");
     const esp_app_desc_t *app_desc = esp_app_get_description();
+    #if CONFIG_IDF_TARGET_ESP32P4
+    shell_print("\r\n\033[38;2;255;212;120m    Product:\033[0m Waveshare ESP32-P4-WIFI6-Touch-LCD-7B");
+    #else
     shell_print("\r\n\033[38;2;255;212;120m    Product:\033[0m Waveshare ESP32-S3-Touch-LCD-7");
+    #endif
     shell_print("\r\n\033[38;2;255;212;120m    DumbESPty version:\033[0m ");
     shell_print(app_desc->version);
     shell_print("\r\n\033[38;2;255;212;120m    Author:\033[0m Jason Throm");
     shell_print("\r\n\033[38;2;255;212;120m    GitHub:\033[0m https://github.com/JThrom/DumbESPty");
     shell_print("\r\n\033[38;2;255;212;120m    License:\033[0m GNU/GPL v2");
-    shell_print("\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel, terminal grid 100 x 32, cell 8 x 15");
+    if (term) {
+        char display_line[128];
+        snprintf(display_line,
+                 sizeof(display_line),
+                 "\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel, terminal grid %d x %d, cell %d x %d",
+                 term->cols,
+                 term->rows,
+                 term->font_w,
+                 term->font_h);
+        shell_print(display_line);
+    } else {
+        shell_print("\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel");
+    }
     shell_print("\r\n\033[38;2;255;212;120m    Controller helper:\033[0m CH422G I2C expander init path enabled");
 
     shell_print("\r\n\r\n\033[48;2;16;36;72m\033[38;2;130;220;255m  MCU + SDK\033[0m");
+    #if CONFIG_IDF_TARGET_ESP32P4
+    shell_print("\r\n\033[38;2;130;220;255m    MCU:\033[0m Espressif ESP32-P4 (dual-core + LP core, Wi-Fi 6 companion + BLE path)");
+    #else
     shell_print("\r\n\033[38;2;130;220;255m    MCU:\033[0m Espressif ESP32-S3 (dual-core Xtensa LX7, Wi-Fi + BLE)");
+    #endif
     shell_print("\r\n\033[38;2;130;220;255m    ESP-IDF:\033[0m ");
     shell_print(esp_get_idf_version());
     shell_print("\r\n\033[38;2;130;220;255m    FreeRTOS:\033[0m ");
@@ -361,63 +522,360 @@ static void cmd_about_handler(int argc, char **argv) {
 
 static char ssh_host[64];
 static uint16_t ssh_port;
-static char ssh_user[32];
+static char ssh_user[32] = "root";
 
 typedef struct {
     char host[64];
     uint16_t port;
     char user[32];
-    char pass[INPUT_BUF_SIZE];
+    char pass[SSH_PASS_BUF_SIZE];
+    bool allow_password_prompt;
 } ssh_connect_ctx_t;
 
-static void ssh_connect_task(void *param) {
-    ssh_connect_ctx_t *ctx = (ssh_connect_ctx_t *)param;
-    bool ok = ssh_connect(ctx->host, ctx->port, ctx->user, ctx->pass);
-    if (ok) {
-        shell_set_ssh_active(true);
-    } else {
-        shell_print("\r\n  SSH connection failed");
-        if (!ssh_active) prompt(true);
-    }
-    ssh_connect_pending = false;
-    free(ctx);
-    vTaskDelete(NULL);
+static TaskHandle_t ssh_connect_worker_handle = NULL;
+static ssh_connect_ctx_t *ssh_connect_ctx_pending = NULL;
+
+static void ssh_password_cb(const char *pass);
+static bool ensure_ssh_connect_worker(void);
+static void cmd_sshkey_handler(int argc, char **argv);
+
+typedef enum {
+    SSHKEY_PENDING_NONE = 0,
+    SSHKEY_PENDING_IMPORT_VAULT_PASS,
+    SSHKEY_PENDING_IMPORT_PRIVATE_KEY,
+    SSHKEY_PENDING_IMPORT_KEY_PASSPHRASE,
+    SSHKEY_PENDING_LOAD_VAULT_PASS,
+} sshkey_pending_t;
+
+static sshkey_pending_t s_sshkey_pending = SSHKEY_PENDING_NONE;
+static char s_sshkey_vault_pass[SSH_PASS_BUF_SIZE] = {0};
+static char s_sshkey_private_key[SSH_KEY_MAX_LEN] = {0};
+static char s_sshkey_key_passphrase[SSH_PASS_BUF_SIZE] = {0};
+
+static inline void shell_secure_zero(void *p, size_t len) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (len--) *v++ = 0;
 }
 
-static void ssh_password_cb(const char *pass) {
+static void sshkey_reset_pending(void) {
+    s_sshkey_pending = SSHKEY_PENDING_NONE;
+    shell_secure_zero(s_sshkey_vault_pass, sizeof(s_sshkey_vault_pass));
+    shell_secure_zero(s_sshkey_private_key, sizeof(s_sshkey_private_key));
+    shell_secure_zero(s_sshkey_key_passphrase, sizeof(s_sshkey_key_passphrase));
+    s_sshkey_vault_pass[0] = '\0';
+    s_sshkey_private_key[0] = '\0';
+    s_sshkey_key_passphrase[0] = '\0';
+}
+
+static void decode_escaped_newlines(const char *src, char *dst, size_t dst_cap) {
+    if (!src || !dst || dst_cap == 0) return;
+    size_t o = 0;
+    for (size_t i = 0; src[i] != '\0' && o + 1 < dst_cap; i++) {
+        if (src[i] == '\\' && src[i + 1] == 'n') {
+            dst[o++] = '\n';
+            i++;
+            continue;
+        }
+        if (src[i] == '\r') continue;
+        dst[o++] = src[i];
+    }
+    dst[o] = '\0';
+}
+
+static void sshkey_input_cb(const char *input) {
+    if (!input) {
+        sshkey_reset_pending();
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_IMPORT_VAULT_PASS) {
+        snprintf(s_sshkey_vault_pass, sizeof(s_sshkey_vault_pass), "%s", input);
+        if (s_sshkey_vault_pass[0] == '\0') {
+            shell_print("\r\n  vault password required");
+            sshkey_reset_pending();
+            return;
+        }
+
+        if (!secret_vault_password_is_set()) {
+            esp_err_t err = secret_vault_password_set(s_sshkey_vault_pass);
+            if (err != ESP_OK) {
+                shell_print("\r\n  failed to set vault password");
+                sshkey_reset_pending();
+                return;
+            }
+        } else if (secret_vault_password_check(s_sshkey_vault_pass) != ESP_OK) {
+            shell_print("\r\n  invalid vault password");
+            sshkey_reset_pending();
+            return;
+        }
+
+        s_sshkey_pending = SSHKEY_PENDING_IMPORT_PRIVATE_KEY;
+        shell_print("\r\n  Private key PEM (use \\\\n for line breaks): ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_IMPORT_PRIVATE_KEY) {
+        decode_escaped_newlines(input, s_sshkey_private_key, sizeof(s_sshkey_private_key));
+        if (strstr(s_sshkey_private_key, "-----BEGIN") == NULL) {
+            shell_print("\r\n  invalid key format (expected PEM with BEGIN line)");
+            sshkey_reset_pending();
+            return;
+        }
+
+        s_sshkey_pending = SSHKEY_PENDING_IMPORT_KEY_PASSPHRASE;
+        shell_print("\r\n  Key passphrase (empty for none): ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_IMPORT_KEY_PASSPHRASE) {
+        snprintf(s_sshkey_key_passphrase, sizeof(s_sshkey_key_passphrase), "%s", input);
+
+        if (!ssh_set_private_key_pem(s_sshkey_private_key, s_sshkey_key_passphrase)) {
+            shell_print("\r\n  failed to load key in runtime");
+            sshkey_reset_pending();
+            return;
+        }
+
+        esp_err_t err = secret_vault_store(SSH_VAULT_KEY_PRIVATE,
+                                           s_sshkey_private_key,
+                                           s_sshkey_vault_pass);
+        if (err != ESP_OK) {
+            shell_print("\r\n  failed to store private key in vault");
+            sshkey_reset_pending();
+            return;
+        }
+
+        if (s_sshkey_key_passphrase[0]) {
+            err = secret_vault_store(SSH_VAULT_KEY_PASSPHRASE,
+                                     s_sshkey_key_passphrase,
+                                     s_sshkey_vault_pass);
+            if (err != ESP_OK) {
+                shell_print("\r\n  key stored, but failed to store key passphrase");
+                sshkey_reset_pending();
+                return;
+            }
+        } else {
+            secret_vault_remove(SSH_VAULT_KEY_PASSPHRASE);
+        }
+
+        shell_print("\r\n  SSH key imported and loaded");
+        sshkey_reset_pending();
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_LOAD_VAULT_PASS) {
+        char key_buf[SSH_KEY_MAX_LEN] = {0};
+        char key_pass[SSH_PASS_BUF_SIZE] = {0};
+        snprintf(s_sshkey_vault_pass, sizeof(s_sshkey_vault_pass), "%s", input);
+        if (s_sshkey_vault_pass[0] == '\0') {
+            shell_print("\r\n  vault password required");
+            sshkey_reset_pending();
+            return;
+        }
+
+        esp_err_t err = secret_vault_load(SSH_VAULT_KEY_PRIVATE,
+                                          s_sshkey_vault_pass,
+                                          key_buf,
+                                          sizeof(key_buf));
+        if (err != ESP_OK) {
+            shell_print("\r\n  invalid vault password or missing ssh key");
+            shell_secure_zero(key_buf, sizeof(key_buf));
+            sshkey_reset_pending();
+            return;
+        }
+
+        err = secret_vault_load(SSH_VAULT_KEY_PASSPHRASE,
+                                s_sshkey_vault_pass,
+                                key_pass,
+                                sizeof(key_pass));
+        if (err != ESP_OK) {
+            key_pass[0] = '\0';
+        }
+
+        if (!ssh_set_private_key_pem(key_buf, key_pass)) {
+            shell_print("\r\n  failed to load key from vault");
+            shell_secure_zero(key_buf, sizeof(key_buf));
+            shell_secure_zero(key_pass, sizeof(key_pass));
+            sshkey_reset_pending();
+            return;
+        }
+
+        shell_print("\r\n  SSH key loaded from vault");
+        shell_secure_zero(key_buf, sizeof(key_buf));
+        shell_secure_zero(key_pass, sizeof(key_pass));
+        sshkey_reset_pending();
+        return;
+    }
+
+    sshkey_reset_pending();
+}
+
+static bool queue_ssh_connect(const char *pass, bool allow_password_prompt) {
     if (ssh_connect_pending) {
         shell_print("\r\n  SSH connect already in progress");
-        return;
+        return false;
     }
 
     ssh_connect_ctx_t *ctx = (ssh_connect_ctx_t *)malloc(sizeof(ssh_connect_ctx_t));
     if (!ctx) {
         shell_print("\r\n  SSH connect alloc failed");
-        return;
+        return false;
     }
 
-    strncpy(ctx->host, ssh_host, sizeof(ctx->host) - 1);
-    ctx->host[sizeof(ctx->host) - 1] = '\0';
+    snprintf(ctx->host, sizeof(ctx->host), "%s", ssh_host);
     ctx->port = ssh_port;
-    strncpy(ctx->user, ssh_user, sizeof(ctx->user) - 1);
-    ctx->user[sizeof(ctx->user) - 1] = '\0';
-    strncpy(ctx->pass, pass, sizeof(ctx->pass) - 1);
-    ctx->pass[sizeof(ctx->pass) - 1] = '\0';
+    snprintf(ctx->user, sizeof(ctx->user), "%s", ssh_user);
+    snprintf(ctx->pass, sizeof(ctx->pass), "%s", pass ? pass : "");
+    ctx->allow_password_prompt = allow_password_prompt;
 
     ssh_connect_pending = true;
     shell_print("\r\n  Connecting...");
 
-    BaseType_t ret = xTaskCreatePinnedToCore(ssh_connect_task, "ssh_connect", 12288, ctx, 5, NULL, 1);
-    if (ret != pdPASS) {
+    if (!ensure_ssh_connect_worker()) {
+        ssh_connect_pending = false;
+        shell_print("\r\n  SSH worker task create failed");
+        free(ctx);
+        return false;
+    }
+
+    ssh_connect_ctx_pending = ctx;
+    xTaskNotifyGive(ssh_connect_worker_handle);
+    return true;
+}
+
+static void ssh_connect_worker_task(void *param) {
+    (void)param;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        ssh_connect_ctx_t *ctx = ssh_connect_ctx_pending;
+        ssh_connect_ctx_pending = NULL;
+        if (!ctx) {
+            ssh_connect_pending = false;
+            continue;
+        }
+
+        bool ok = ssh_connect(ctx->host, ctx->port, ctx->user, ctx->pass);
+        if (ok) {
+            shell_set_ssh_active(true);
+            shell_print("\033[2J\033[H");
+        } else if (ctx->allow_password_prompt && ssh_last_connect_requires_password()) {
+            shell_print("\r\n  Password: ");
+            shell_get_hidden_input(ssh_password_cb);
+        } else {
+            const char *why = ssh_last_connect_error();
+            if (why && why[0]) {
+                shell_print("\r\n  SSH connection failed: ");
+                shell_print(why);
+            } else {
+                shell_print("\r\n  SSH connection failed");
+            }
+            if (!ssh_active) prompt(true);
+        }
         ssh_connect_pending = false;
         free(ctx);
-        shell_print("\r\n  SSH connect task create failed");
     }
+}
+
+static bool ensure_ssh_connect_worker(void) {
+    if (ssh_connect_worker_handle) return true;
+
+    /*
+     * SSH connect path may persist trust records (NVS flash writes).
+     * Keep this task stack in internal RAM so cache-disabled flash sections
+     * do not trip esp_task_stack_is_sane_cache_disabled().
+     */
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        ssh_connect_worker_task,
+        "ssh_connect",
+        16384,
+        NULL,
+        5,
+        &ssh_connect_worker_handle,
+        1,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (ret != pdPASS) {
+        ret = xTaskCreatePinnedToCoreWithCaps(
+            ssh_connect_worker_task,
+            "ssh_connect",
+            12288,
+            NULL,
+            5,
+            &ssh_connect_worker_handle,
+            1,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return ret == pdPASS;
+}
+
+static void ssh_password_cb(const char *pass) {
+    queue_ssh_connect(pass, false);
+}
+
+static void cmd_sshkey_handler(int argc, char **argv) {
+    if (argc < 2) {
+        shell_print("\r\n  usage: sshkey status|import|load|clear|erase");
+        return;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        shell_print(ssh_has_private_key()
+                        ? "\r\n  runtime key: loaded"
+                        : "\r\n  runtime key: not loaded");
+        shell_print(secret_vault_exists(SSH_VAULT_KEY_PRIVATE)
+                        ? "\r\n  vault key: present"
+                        : "\r\n  vault key: missing");
+        return;
+    }
+
+    if (strcmp(argv[1], "import") == 0) {
+        if (s_sshkey_pending != SSHKEY_PENDING_NONE) {
+            shell_print("\r\n  sshkey flow already in progress");
+            return;
+        }
+        s_sshkey_pending = SSHKEY_PENDING_IMPORT_VAULT_PASS;
+        shell_print("\r\n  Vault password: ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (strcmp(argv[1], "load") == 0) {
+        if (!secret_vault_exists(SSH_VAULT_KEY_PRIVATE)) {
+            shell_print("\r\n  no ssh key found in vault");
+            return;
+        }
+        if (s_sshkey_pending != SSHKEY_PENDING_NONE) {
+            shell_print("\r\n  sshkey flow already in progress");
+            return;
+        }
+        s_sshkey_pending = SSHKEY_PENDING_LOAD_VAULT_PASS;
+        shell_print("\r\n  Vault password: ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (strcmp(argv[1], "clear") == 0) {
+        ssh_clear_private_key();
+        shell_print("\r\n  runtime ssh key cleared");
+        return;
+    }
+
+    if (strcmp(argv[1], "erase") == 0) {
+        ssh_clear_private_key();
+        secret_vault_remove(SSH_VAULT_KEY_PRIVATE);
+        secret_vault_remove(SSH_VAULT_KEY_PASSPHRASE);
+        shell_print("\r\n  ssh key erased from runtime and vault");
+        return;
+    }
+
+    shell_print("\r\n  usage: sshkey status|import|load|clear|erase");
 }
 
 static void cmd_ssh_handler(int argc, char **argv) {
     if (argc < 2) {
-        shell_print("\r\n  Usage: ssh user@host[:port]");
+        shell_print("\r\n  Usage: ssh [user@]host[:port]");
         return;
     }
 
@@ -428,32 +886,56 @@ static void cmd_ssh_handler(int argc, char **argv) {
 
     const char *arg = argv[1];
     const char *at = strchr(arg, '@');
-    if (!at) {
-        shell_print("\r\n  Usage: ssh user@host[:port]");
+    const char *host_part = arg;
+
+    if (at) {
+        int user_len = at - arg;
+        if (user_len <= 0) {
+            shell_print("\r\n  Invalid SSH target");
+            return;
+        }
+        if (user_len >= (int)sizeof(ssh_user)) user_len = sizeof(ssh_user) - 1;
+        memcpy(ssh_user, arg, user_len);
+        ssh_user[user_len] = '\0';
+        host_part = at + 1;
+    } else if (ssh_user[0] == '\0') {
+        snprintf(ssh_user, sizeof(ssh_user), "%s", "root");
+    }
+
+    if (host_part[0] == '\0') {
+        shell_print("\r\n  Invalid SSH target");
         return;
     }
 
-    int user_len = at - arg;
-    if (user_len >= (int)sizeof(ssh_user)) user_len = sizeof(ssh_user) - 1;
-    memcpy(ssh_user, arg, user_len);
-    ssh_user[user_len] = '\0';
-
-    const char *host_part = at + 1;
     const char *colon = strchr(host_part, ':');
     if (colon) {
         int host_len = colon - host_part;
+        if (host_len <= 0) {
+            shell_print("\r\n  Invalid SSH host");
+            return;
+        }
         if (host_len >= (int)sizeof(ssh_host)) host_len = sizeof(ssh_host) - 1;
         memcpy(ssh_host, host_part, host_len);
         ssh_host[host_len] = '\0';
-        ssh_port = atoi(colon + 1);
+
+        const char *port_str = colon + 1;
+        if (port_str[0] == '\0') {
+            shell_print("\r\n  Invalid SSH port");
+            return;
+        }
+        char *end = NULL;
+        long parsed_port = strtol(port_str, &end, 10);
+        if (*end != '\0' || parsed_port <= 0 || parsed_port > 65535) {
+            shell_print("\r\n  Invalid SSH port");
+            return;
+        }
+        ssh_port = (uint16_t)parsed_port;
     } else {
-        strncpy(ssh_host, host_part, sizeof(ssh_host) - 1);
-        ssh_host[sizeof(ssh_host) - 1] = '\0';
+        snprintf(ssh_host, sizeof(ssh_host), "%s", host_part);
         ssh_port = 22;
     }
 
-    shell_print("\r\n  Password: ");
-    shell_get_hidden_input(ssh_password_cb);
+    queue_ssh_connect("", true);
 }
 
 void shell_init(terminal_t *t) {
@@ -470,6 +952,10 @@ void shell_init(terminal_t *t) {
     shell_register_cmd("clear", cmd_clear_handler);
     shell_register_cmd("wifi", cmd_wifi);
     shell_register_cmd("ssh", cmd_ssh_handler);
+    shell_register_cmd("sshkey", cmd_sshkey_handler);
+    shell_register_cmd("tailscale", cmd_tailscale);
+    shell_register_cmd("hostname", cmd_hostname);
+    shell_register_cmd("vault", cmd_vault);
     shell_register_cmd("about", cmd_about_handler);
 
     terminal_write(term, "$ ", -1);

@@ -15,6 +15,8 @@ bool     wifi_mgr_is_connected(void);
 const char *wifi_mgr_get_ssid(void);
 void     wifi_mgr_get_status(char *buf, size_t len);
 void     wifi_mgr_process_queue(void);
+int      wifi_mgr_get_saved_ssids(char out[][33], int max_entries);
+esp_err_t wifi_mgr_apply_hostname(const char *hostname);
 
 #ifdef __cplusplus
 }

@@ -1,26 +1,43 @@
 #include "wifi_mgr.hpp"
-#include "shell.hpp"
-#include "coex_manager.hpp"
-#include <cstring>
+
 #include <cstdio>
-#include "esp_log.h"
+#include <cstdlib>
+#include <cctype>
+#include <cstring>
+
+#include "coex_manager.hpp"
 #include "esp_event.h"
-#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
-
-extern "C" bool esp_wifi_skip_supp_pmkcaching(void) {
-    return true;
-}
-
+#include "nvs.h"
+#include "hostname_mgr.hpp"
+#include "shell.hpp"
+#include "secret_vault.hpp"
 
 static const char *TAG = "wifi";
 
 #define MAX_APS 32
 #define WIFI_MSG_QUEUE_SIZE 8
 #define CONNECT_TIMEOUT_MS 15000
+#define CONNECT_RETRY_TIMEOUT_MS 18000
+#define CONNECT_POLL_MS 200
+#define MAX_WIFI_PROFILES 16
+#define WIFI_PROFILE_NS "wificfg"
+#define WIFI_PROFILE_KEY "ssids"
+
+typedef struct {
+    char text[80];
+} wifi_msg_t;
+
+typedef struct {
+    uint8_t count;
+    char ssids[MAX_WIFI_PROFILES][33];
+} wifi_profiles_t;
 
 static bool initialized = false;
 static bool scanning = false;
@@ -31,13 +48,132 @@ static char current_ssid[33] = "";
 static char connect_ssid[33] = "";
 
 static QueueHandle_t wifi_msg_queue = NULL;
-static SemaphoreHandle_t connect_sem = NULL;
 static bool connect_success = false;
 static char connect_ip[16] = "";
+static esp_netif_t *s_sta_netif = NULL;
 
-typedef struct {
-    char text[80];
-} wifi_msg_t;
+static wifi_profiles_t s_profiles = {};
+
+enum wifi_pending_action_t {
+    WIFI_PENDING_NONE = 0,
+    WIFI_PENDING_CONNECT_WIFI_PASS,
+    WIFI_PENDING_CONNECT_VAULT,
+    WIFI_PENDING_CONNECT_SETUP_VAULT,
+    WIFI_PENDING_CONNECT_SETUP_VAULT_CONFIRM,
+    WIFI_PENDING_CONNECT_STORE_VAULT,
+};
+
+static wifi_pending_action_t s_pending_action = WIFI_PENDING_NONE;
+static char s_pending_ssid[33] = "";
+static char s_pending_secret[256] = "";
+static char s_pending_vault_pass[128] = "";
+
+static void copy_ssid_trimmed(const char *src, char *dst, size_t dst_len) {
+    if (!dst || dst_len == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    size_t n = strnlen(src, dst_len - 1);
+    while (n > 0 && isspace((unsigned char)src[n - 1])) n--;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static void vault_key_for_ssid_v1(const char *ssid, char *out, size_t out_len) {
+    snprintf(out, out_len, "wifi/%s", ssid);
+}
+
+static bool check_current_ip(void) {
+    if (!s_sta_netif) return false;
+    esp_netif_ip_info_t ip_info = {};
+    if (esp_netif_get_ip_info(s_sta_netif, &ip_info) != ESP_OK) return false;
+    if (ip_info.ip.addr == 0) return false;
+    snprintf(connect_ip, sizeof(connect_ip), IPSTR, IP2STR(&ip_info.ip));
+    connect_success = true;
+    return true;
+}
+
+static bool wait_for_ip_or_connected(int timeout_ms, const char *phase) {
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline_us) {
+        if (connect_success || check_current_ip()) {
+            return true;
+        }
+        if (!connected) {
+            vTaskDelay(pdMS_TO_TICKS(CONNECT_POLL_MS));
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(CONNECT_POLL_MS));
+    }
+    ESP_LOGW(TAG, "%s timeout; connected=%d ip=%s", phase, connected ? 1 : 0, connect_ip[0] ? connect_ip : "none");
+    return connect_success || check_current_ip();
+}
+
+static void load_profiles(void) {
+    memset(&s_profiles, 0, sizeof(s_profiles));
+    nvs_handle_t nvs = 0;
+    if (nvs_open(WIFI_PROFILE_NS, NVS_READONLY, &nvs) != ESP_OK) return;
+    size_t len = sizeof(s_profiles);
+    esp_err_t err = nvs_get_blob(nvs, WIFI_PROFILE_KEY, &s_profiles, &len);
+    nvs_close(nvs);
+    if (err != ESP_OK || len != sizeof(s_profiles) || s_profiles.count > MAX_WIFI_PROFILES) {
+        memset(&s_profiles, 0, sizeof(s_profiles));
+    }
+}
+
+static esp_err_t save_profiles(void) {
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(WIFI_PROFILE_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(nvs, WIFI_PROFILE_KEY, &s_profiles, sizeof(s_profiles));
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+static int find_profile_index(const char *ssid) {
+    for (int i = 0; i < s_profiles.count; i++) {
+        if (strcmp(s_profiles.ssids[i], ssid) == 0) return i;
+    }
+    return -1;
+}
+
+static esp_err_t remember_ssid(const char *ssid) {
+    if (!ssid || !ssid[0]) return ESP_ERR_INVALID_ARG;
+    if (find_profile_index(ssid) >= 0) return ESP_OK;
+    if (s_profiles.count >= MAX_WIFI_PROFILES) {
+        for (int i = 1; i < MAX_WIFI_PROFILES; i++) {
+            snprintf(s_profiles.ssids[i - 1], sizeof(s_profiles.ssids[i - 1]), "%s", s_profiles.ssids[i]);
+        }
+        s_profiles.count = MAX_WIFI_PROFILES - 1;
+    }
+    snprintf(s_profiles.ssids[s_profiles.count], sizeof(s_profiles.ssids[s_profiles.count]), "%s", ssid);
+    s_profiles.count++;
+    return save_profiles();
+}
+
+static esp_err_t forget_ssid_profile(const char *ssid) {
+    const int idx = find_profile_index(ssid);
+    if (idx < 0) return ESP_ERR_NOT_FOUND;
+    for (int i = idx + 1; i < s_profiles.count; i++) {
+        snprintf(s_profiles.ssids[i - 1], sizeof(s_profiles.ssids[i - 1]), "%s", s_profiles.ssids[i]);
+    }
+    memset(s_profiles.ssids[s_profiles.count - 1], 0, sizeof(s_profiles.ssids[s_profiles.count - 1]));
+    s_profiles.count--;
+    return save_profiles();
+}
+
+static void on_crypt_pass_input(const char *crypt_pass);
+
+static void vault_key_for_ssid(const char *ssid, char *out, size_t out_len) {
+    uint32_t h = 2166136261u;
+    const uint8_t *p = (const uint8_t *)ssid;
+    while (*p) {
+        h ^= *p++;
+        h *= 16777619u;
+    }
+    snprintf(out, out_len, "wf%08x", (unsigned)h);
+}
 
 static void dump_scan_results(void) {
     uint16_t ap_count = 0;
@@ -62,8 +198,7 @@ static void dump_scan_results(void) {
     scan_count = ap_count;
     char buf[256];
     for (int i = 0; i < ap_count; i++) {
-        strncpy(scan_results[i], (const char *)aps[i].ssid, 32);
-        scan_results[i][32] = '\0';
+        snprintf(scan_results[i], sizeof(scan_results[i]), "%s", (const char *)aps[i].ssid);
         int rssi = aps[i].rssi;
         const char *auth = "";
         switch (aps[i].authmode) {
@@ -97,14 +232,18 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         connected = false;
         connect_success = false;
         coex_release();
-        xSemaphoreGive(connect_sem);
+        connect_ip[0] = '\0';
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
+        if (disc) {
+            ESP_LOGW(TAG, "STA disconnected reason=%u", (unsigned)disc->reason);
+        }
         return;
     }
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
         snprintf(connect_ip, sizeof(connect_ip), IPSTR, IP2STR(&evt->ip_info.ip));
         connect_success = true;
-        xSemaphoreGive(connect_sem);
+        ESP_LOGI(TAG, "Got IP %s", connect_ip);
         return;
     }
 }
@@ -112,8 +251,14 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
 esp_err_t wifi_mgr_init(void) {
     if (initialized) return ESP_OK;
 
+    load_profiles();
+    secret_vault_init();
+
     wifi_msg_queue = xQueueCreate(WIFI_MSG_QUEUE_SIZE, sizeof(wifi_msg_t));
-    connect_sem = xSemaphoreCreateBinary();
+
+#if CONFIG_IDF_TARGET_ESP32P4
+    ESP_LOGI(TAG, "Wi-Fi init on esp32p4 via esp-hosted");
+#endif
 
     esp_err_t ret = esp_netif_init();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "netif init: %s", esp_err_to_name(ret)); return ret; }
@@ -133,10 +278,15 @@ esp_err_t wifi_mgr_init(void) {
     ret = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "reg got ip: %s", esp_err_to_name(ret)); return ret; }
 
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    if (!s_sta_netif) {
+        ESP_LOGE(TAG, "create default STA netif failed");
+        return ESP_FAIL;
+    }
 
-    wifi_country_t country;
-    memset(&country, 0, sizeof(country));
+    wifi_mgr_apply_hostname(hostname_mgr_get());
+
+    wifi_country_t country = {};
     strcpy(country.cc, "US");
     country.schan = 1;
     country.nchan = 11;
@@ -145,6 +295,9 @@ esp_err_t wifi_mgr_init(void) {
 
     ret = esp_wifi_set_mode(WIFI_MODE_STA);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "set mode: %s", esp_err_to_name(ret)); return ret; }
+
+    ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "set storage: %s", esp_err_to_name(ret)); return ret; }
 
     ret = esp_wifi_start();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "start: %s", esp_err_to_name(ret)); return ret; }
@@ -156,7 +309,14 @@ esp_err_t wifi_mgr_init(void) {
     return ESP_OK;
 }
 
+esp_err_t wifi_mgr_apply_hostname(const char *hostname) {
+    if (!hostname || !hostname[0]) return ESP_ERR_INVALID_ARG;
+    if (!s_sta_netif) return ESP_ERR_INVALID_STATE;
+    return esp_netif_set_hostname(s_sta_netif, hostname);
+}
+
 void wifi_mgr_process_queue(void) {
+    if (!wifi_msg_queue) return;
     wifi_msg_t msg;
     while (xQueueReceive(wifi_msg_queue, &msg, 0) == pdTRUE) {
         shell_print(msg.text);
@@ -170,8 +330,7 @@ esp_err_t wifi_mgr_scan(void) {
     }
     scanning = true;
     shell_print("\r\n  scanning...");
-    wifi_scan_config_t conf;
-    memset(&conf, 0, sizeof(conf));
+    wifi_scan_config_t conf = {};
     conf.show_hidden = false;
     conf.scan_type = WIFI_SCAN_TYPE_ACTIVE;
     esp_err_t ret = esp_wifi_scan_start(&conf, true);
@@ -186,8 +345,8 @@ esp_err_t wifi_mgr_scan(void) {
 
 bool wifi_mgr_connect(const char *ssid, const char *password) {
     wifi_config_t cfg = {};
-    strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
-    if (password) strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
+    snprintf((char *)cfg.sta.ssid, sizeof(cfg.sta.ssid), "%s", ssid);
+    if (password) snprintf((char *)cfg.sta.password, sizeof(cfg.sta.password), "%s", password);
     cfg.sta.threshold.authmode = (password && password[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     cfg.sta.pmf_cfg.capable = true;
     cfg.sta.pmf_cfg.required = false;
@@ -195,8 +354,7 @@ bool wifi_mgr_connect(const char *ssid, const char *password) {
     esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &cfg);
     if (ret != ESP_OK) return false;
 
-    strncpy(current_ssid, ssid, 32);
-    current_ssid[32] = '\0';
+    snprintf(current_ssid, sizeof(current_ssid), "%s", ssid);
 
     shell_print("\r\n  connecting to ");
     shell_print(ssid);
@@ -204,54 +362,161 @@ bool wifi_mgr_connect(const char *ssid, const char *password) {
     coex_acquire();
 
     connect_success = false;
-    xSemaphoreTake(connect_sem, 0);
+    connect_ip[0] = '\0';
+
+    if (connected) {
+        esp_wifi_disconnect();
+        connected = false;
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
 
     ret = esp_wifi_connect();
     if (ret != ESP_OK) {
-        shell_print("\r\n  connect failed");
+        shell_print("\r\n  connect failed\r\n");
         coex_release();
         return false;
     }
 
-    if (xSemaphoreTake(connect_sem, pdMS_TO_TICKS(CONNECT_TIMEOUT_MS)) == pdTRUE) {
-        char buf[64];
-        if (connect_success && connect_ip[0]) {
+    char buf[64];
+    if (wait_for_ip_or_connected(CONNECT_TIMEOUT_MS, "connect phase1")) {
+        if (connect_ip[0]) {
             snprintf(buf, sizeof(buf), "\r\n  IP: %s", connect_ip);
             shell_print(buf);
             shell_print("\r\n");
         }
-        if (!connect_success) {
-            shell_print("\r\n  retrying...");
-            shell_print("\r\n");
-            coex_acquire();
-            connect_success = false;
-            xSemaphoreTake(connect_sem, 0);
-            ret = esp_wifi_connect();
-            if (ret == ESP_OK) {
-                xSemaphoreTake(connect_sem, pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
-            }
-            if (connect_success && connect_ip[0]) {
-                snprintf(buf, sizeof(buf), "\r\n  IP: %s", connect_ip);
-                shell_print(buf);
-                shell_print("\r\n");
-            }
-        }
         coex_release();
-        return connect_success;
+        return true;
     }
 
-    shell_print("\r\n  connection timeout");
+    shell_print("\r\n  retrying...");
+    shell_print("\r\n");
+    connect_success = false;
+    connect_ip[0] = '\0';
+    ret = esp_wifi_connect();
+    if (ret == ESP_OK && wait_for_ip_or_connected(CONNECT_RETRY_TIMEOUT_MS, "connect phase2")) {
+        if (connect_ip[0]) {
+            snprintf(buf, sizeof(buf), "\r\n  IP: %s", connect_ip);
+            shell_print(buf);
+            shell_print("\r\n");
+        }
+        coex_release();
+        return true;
+    }
+
+    shell_print("\r\n  connection timeout\r\n");
     esp_wifi_disconnect();
     coex_release();
     return false;
 }
 
-static void connect_with_password(const char *password) {
-    wifi_mgr_connect(connect_ssid, password);
+static void on_password_input(const char *password) {
+    if (s_pending_action != WIFI_PENDING_CONNECT_WIFI_PASS) return;
+
+    snprintf(s_pending_secret, sizeof(s_pending_secret), "%s", password);
+    if (!secret_vault_password_is_set()) {
+        s_pending_action = WIFI_PENDING_CONNECT_SETUP_VAULT;
+        shell_print("\r\n  Vault password: ");
+        shell_get_hidden_input(on_crypt_pass_input);
+        return;
+    }
+
+    s_pending_action = WIFI_PENDING_CONNECT_STORE_VAULT;
+    shell_print("\r\n  Vault password: ");
+    shell_get_hidden_input(on_crypt_pass_input);
+}
+
+static void on_crypt_pass_input(const char *crypt_pass) {
+    if (s_pending_action == WIFI_PENDING_CONNECT_SETUP_VAULT) {
+        snprintf(s_pending_vault_pass, sizeof(s_pending_vault_pass), "%s", crypt_pass);
+        s_pending_action = WIFI_PENDING_CONNECT_SETUP_VAULT_CONFIRM;
+        shell_print("\r\n  Confirm password: ");
+        shell_get_hidden_input(on_crypt_pass_input);
+        return;
+    }
+
+    if (s_pending_action == WIFI_PENDING_CONNECT_SETUP_VAULT_CONFIRM) {
+        if (strcmp(s_pending_vault_pass, crypt_pass) != 0) {
+            shell_print("\r\n  vault passwords do not match\r\n");
+            s_pending_action = WIFI_PENDING_NONE;
+            s_pending_ssid[0] = '\0';
+            memset(s_pending_secret, 0, sizeof(s_pending_secret));
+            memset(s_pending_vault_pass, 0, sizeof(s_pending_vault_pass));
+            return;
+        }
+        if (secret_vault_password_set(s_pending_vault_pass) != ESP_OK) {
+            shell_print("\r\n  failed to set vault password\r\n");
+            s_pending_action = WIFI_PENDING_NONE;
+            s_pending_ssid[0] = '\0';
+            memset(s_pending_secret, 0, sizeof(s_pending_secret));
+            memset(s_pending_vault_pass, 0, sizeof(s_pending_vault_pass));
+            return;
+        }
+        snprintf((char *)connect_ssid, sizeof(connect_ssid), "%s", s_pending_ssid);
+        char vault_key[64];
+        vault_key_for_ssid(s_pending_ssid, vault_key, sizeof(vault_key));
+        if (secret_vault_store(vault_key, s_pending_secret, s_pending_vault_pass) == ESP_OK) {
+            remember_ssid(s_pending_ssid);
+            wifi_mgr_connect(connect_ssid, s_pending_secret);
+        } else {
+            shell_print("\r\n  save failed\r\n");
+        }
+        memset(s_pending_vault_pass, 0, sizeof(s_pending_vault_pass));
+        memset(s_pending_secret, 0, sizeof(s_pending_secret));
+        s_pending_action = WIFI_PENDING_NONE;
+        s_pending_ssid[0] = '\0';
+        return;
+    }
+
+    if (s_pending_action == WIFI_PENDING_CONNECT_STORE_VAULT) {
+        if (secret_vault_password_check(crypt_pass) != ESP_OK) {
+            shell_print("\r\n  invalid vault password\r\n");
+            memset(s_pending_secret, 0, sizeof(s_pending_secret));
+            s_pending_action = WIFI_PENDING_NONE;
+            s_pending_ssid[0] = '\0';
+            return;
+        }
+        snprintf((char *)connect_ssid, sizeof(connect_ssid), "%s", s_pending_ssid);
+        char vault_key[64];
+        vault_key_for_ssid(s_pending_ssid, vault_key, sizeof(vault_key));
+        if (secret_vault_store(vault_key, s_pending_secret, crypt_pass) == ESP_OK) {
+            remember_ssid(s_pending_ssid);
+            wifi_mgr_connect(connect_ssid, s_pending_secret);
+        } else {
+            shell_print("\r\n  save failed\r\n");
+        }
+        memset(s_pending_secret, 0, sizeof(s_pending_secret));
+        s_pending_action = WIFI_PENDING_NONE;
+        s_pending_ssid[0] = '\0';
+        return;
+    }
+
+    if (s_pending_action != WIFI_PENDING_CONNECT_VAULT) {
+        s_pending_action = WIFI_PENDING_NONE;
+        return;
+    }
+    char vault_key[64];
+    char legacy_vault_key[64];
+    char pass[256] = {0};
+    vault_key_for_ssid(s_pending_ssid, vault_key, sizeof(vault_key));
+    vault_key_for_ssid_v1(s_pending_ssid, legacy_vault_key, sizeof(legacy_vault_key));
+    esp_err_t err = secret_vault_load(vault_key, crypt_pass, pass, sizeof(pass));
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = secret_vault_load(legacy_vault_key, crypt_pass, pass, sizeof(pass));
+    }
+    if (err != ESP_OK) {
+        shell_print("\r\n  invalid vault password or missing secret\r\n");
+    } else {
+        snprintf(connect_ssid, sizeof(connect_ssid), "%s", s_pending_ssid);
+        wifi_mgr_connect(connect_ssid, pass);
+    }
+    memset(pass, 0, sizeof(pass));
+    memset(s_pending_secret, 0, sizeof(s_pending_secret));
+    s_pending_action = WIFI_PENDING_NONE;
+    s_pending_ssid[0] = '\0';
 }
 
 esp_err_t wifi_mgr_disconnect(void) {
-    shell_print("\r\n  disconnecting...");
+    shell_print("\r\n  disconnecting...\r\n");
     esp_err_t ret = esp_wifi_disconnect();
     if (ret == ESP_OK) {
         connected = false;
@@ -276,9 +541,18 @@ void wifi_mgr_get_status(char *buf, size_t len) {
     }
 }
 
+int wifi_mgr_get_saved_ssids(char out[][33], int max_entries) {
+    if (!out || max_entries <= 0) return 0;
+    int n = s_profiles.count < max_entries ? s_profiles.count : max_entries;
+    for (int i = 0; i < n; i++) {
+        snprintf(out[i], 33, "%s", s_profiles.ssids[i]);
+    }
+    return n;
+}
+
 void cmd_wifi(int argc, char **argv) {
     if (argc < 2) {
-        shell_print("\r\n  usage: wifi scan|status|connect <ssid>|disconnect");
+        shell_print("\r\n  usage: wifi scan|status|list|connect <ssid>|disconnect|forget <ssid>\r\n");
         return;
     }
     if (strcmp(argv[1], "scan") == 0) {
@@ -289,23 +563,79 @@ void cmd_wifi(int argc, char **argv) {
         shell_print("\r\n  ");
         shell_print(buf);
         shell_print("\r\n");
+    } else if (strcmp(argv[1], "list") == 0) {
+        shell_print("\r\n  saved SSIDs:");
+        if (s_profiles.count == 0) {
+            shell_print("\r\n    (none)");
+        } else {
+            for (int i = 0; i < s_profiles.count; i++) {
+                shell_print("\r\n    ");
+                shell_print(s_profiles.ssids[i]);
+            }
+        }
+        shell_print("\r\n");
     } else if (strcmp(argv[1], "connect") == 0) {
         if (argc < 3) {
-            shell_print("\r\n  usage: wifi connect <ssid> [password]");
+            shell_print("\r\n  usage: wifi connect <ssid>\r\n");
+            shell_print("\r\n  tip: use TAB for saved SSID completion\r\n");
             return;
         }
         if (argc >= 4) {
-            wifi_mgr_connect(argv[2], argv[3]);
-        } else {
-            strncpy(connect_ssid, argv[2], 32);
-            connect_ssid[32] = '\0';
-            shell_print("\r\n  password: ");
-            shell_get_hidden_input(connect_with_password);
+            shell_print("\r\n  usage: wifi connect <ssid>\r\n");
+            return;
         }
+
+        char ssid[33];
+        copy_ssid_trimmed(argv[2], ssid, sizeof(ssid));
+        if (!ssid[0]) {
+            shell_print("\r\n  usage: wifi connect <ssid>\r\n");
+            return;
+        }
+
+        char vault_key[64];
+        char legacy_vault_key[64];
+        vault_key_for_ssid(ssid, vault_key, sizeof(vault_key));
+        vault_key_for_ssid_v1(ssid, legacy_vault_key, sizeof(legacy_vault_key));
+        const bool has_profile = find_profile_index(ssid) >= 0;
+        const bool has_secret = secret_vault_exists(vault_key) || secret_vault_exists(legacy_vault_key);
+        if (has_profile && has_secret) {
+            snprintf(s_pending_ssid, sizeof(s_pending_ssid), "%s", ssid);
+            s_pending_action = WIFI_PENDING_CONNECT_VAULT;
+            shell_print("\r\n  Vault password: ");
+            shell_get_hidden_input(on_crypt_pass_input);
+            return;
+        }
+
+        snprintf(s_pending_ssid, sizeof(s_pending_ssid), "%s", ssid);
+        shell_print("\r\n  wifi password: ");
+        s_pending_action = WIFI_PENDING_CONNECT_WIFI_PASS;
+        shell_get_hidden_input(on_password_input);
     } else if (strcmp(argv[1], "disconnect") == 0) {
         wifi_mgr_disconnect();
+    } else if (strcmp(argv[1], "forget") == 0) {
+        if (argc < 3) {
+            shell_print("\r\n  usage: wifi forget <ssid>\r\n");
+            return;
+        }
+        char ssid[33];
+        copy_ssid_trimmed(argv[2], ssid, sizeof(ssid));
+        if (!ssid[0]) {
+            shell_print("\r\n  usage: wifi forget <ssid>\r\n");
+            return;
+        }
+        char vault_key[64];
+        char legacy_vault_key[64];
+        vault_key_for_ssid(ssid, vault_key, sizeof(vault_key));
+        vault_key_for_ssid_v1(ssid, legacy_vault_key, sizeof(legacy_vault_key));
+        secret_vault_remove(vault_key);
+        secret_vault_remove(legacy_vault_key);
+        forget_ssid_profile(ssid);
+        shell_print("\r\n  forgot ");
+        shell_print(ssid);
+        shell_print("\r\n");
     } else {
         shell_print("\r\n  unknown subcommand: ");
         shell_print(argv[1]);
+        shell_print("\r\n");
     }
 }

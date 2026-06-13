@@ -1,5 +1,8 @@
 .DS_Store
 
+# Local secrets (Tailscale auth key, etc.)
+.tsauth
+
 # ESP-IDF generated outputs
 build/
 .idf/

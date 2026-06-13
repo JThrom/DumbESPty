@@ -4,18 +4,35 @@
 #include "shell.hpp"
 #include "ui_status_menu.hpp"
 #include "wifi_mgr.hpp"
+#include "hostname_mgr.hpp"
 #include "ssh_client.hpp"
+#include "tailscale_mgr.hpp"
 #include "terminal.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_psram.h"
+#include "esp_crypto_lock.h"
 #include "nvs_flash.h"
 #include "lvgl.h"
 
 static const char *TAG = "console";
 static lv_obj_t *status_label = NULL;
 static terminal_t terminal;
+
+static void warm_crypto_locks(void) {
+    esp_crypto_mpi_lock_acquire();
+    esp_crypto_mpi_lock_release();
+#ifdef SOC_ECC_SUPPORTED
+    esp_crypto_ecc_lock_acquire();
+    esp_crypto_ecc_lock_release();
+#endif
+#ifdef SOC_ECDSA_SUPPORTED
+    esp_crypto_ecdsa_lock_acquire();
+    esp_crypto_ecdsa_lock_release();
+#endif
+    ESP_LOGI(TAG, "Crypto locks warmed");
+}
 
 static void lv_tick_task(void *arg) {
     while (1) {
@@ -38,17 +55,23 @@ extern "C" void app_main(void) {
     }
     ESP_LOGI(TAG, "NVS init OK");
 
+#if CONFIG_IDF_TARGET_ESP32S3
     ret = ch422g_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "CH422G init failed: %s", esp_err_to_name(ret));
         return;
     }
     ESP_LOGI(TAG, "CH422G init OK");
+#else
+    ESP_LOGI(TAG, "Skipping CH422G init on this target");
+#endif
 
     if (esp_psram_is_initialized())
         ESP_LOGI(TAG, "PSRAM initialized");
     else
         ESP_LOGW(TAG, "PSRAM not initialized");
+
+    warm_crypto_locks();
 
     lv_init();
     ESP_LOGI(TAG, "LVGL initialized");
@@ -80,11 +103,20 @@ extern "C" void app_main(void) {
     extern const lv_font_t lv_font_nerd_symbols_10;
     extern const cozette_bdf_font_t g_cozette_bdf_13;
 
+    const int cell_w = 8;
+    const int cell_h = 15;
+    int cols = waveshare_display_width() / cell_w;
+    int rows = waveshare_display_height() / cell_h;
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+    if (cols > TERM_MAX_COLS) cols = TERM_MAX_COLS;
+    if (rows > TERM_MAX_ROWS) rows = TERM_MAX_ROWS;
+
     terminal_init(&terminal,
-                  100,
-                  32,
-                  8,
-                  15,
+                  cols,
+                  rows,
+                  cell_w,
+                  cell_h,
                   lv_scr_act(),
                   &g_cozette_bdf_13,
                   &lv_font_term_mono_10,
@@ -101,6 +133,12 @@ extern "C" void app_main(void) {
 
     shell_init(&terminal);
 
+    ret = hostname_mgr_init();
+    if (ret != ESP_OK)
+        ESP_LOGE(TAG, "Hostname init: %s", esp_err_to_name(ret));
+    else
+        ESP_LOGI(TAG, "Hostname: %s", hostname_mgr_get());
+
     if (status_label) {
         lv_obj_del(status_label);
         status_label = NULL;
@@ -116,7 +154,9 @@ extern "C" void app_main(void) {
 
     // Init BLE HID host
     ret = ble_hid_host_init();
-    if (ret != ESP_OK) {
+    if (ret == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGI(TAG, "BLE HID host unsupported on this target; continuing without BLE keyboard");
+    } else if (ret != ESP_OK) {
         ESP_LOGE(TAG, "BLE HID host init failed: %s", esp_err_to_name(ret));
         shell_print("\r\n  BLE HID Error");
     } else {
@@ -128,11 +168,18 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "Touch/status menu init failed: %s", esp_err_to_name(ret));
     }
 
+    ret = tailscale_mgr_init();
+    if (ret != ESP_OK)
+        ESP_LOGE(TAG, "Tailscale init: %s", esp_err_to_name(ret));
+    else
+        ESP_LOGI(TAG, "Tailscale init OK");
+
     while (1) {
         ble_hid_process_queue();
         lv_obj_clear_flag(terminal.canvas, LV_OBJ_FLAG_HIDDEN);
 
         wifi_mgr_process_queue();
+        tailscale_mgr_process_queue();
         ssh_process_queue();
         ui_status_menu_update();
         terminal_render(&terminal);
