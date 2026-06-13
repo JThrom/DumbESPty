@@ -42,6 +42,7 @@ static terminal_t *term = NULL;
 static char input_buf[INPUT_BUF_SIZE];
 static int input_len = 0;
 static int input_cursor = 0;
+static int rendered_input_len = 0;
 
 static char history[HISTORY_SIZE][INPUT_BUF_SIZE];
 static int history_count = 0;
@@ -54,12 +55,15 @@ static bool ssh_connect_pending = false;
 static bool suppress_prompt_once = false;
 static bool input_masked = false;
 
-static bool completion_active = false;
 static int completion_count = 0;
-static int completion_index = 0;
+static int completion_context_argc = 0;
 static int completion_token_start = 0;
 static int completion_token_len = 0;
 static char completion_items[16][33];
+static bool completion_tab_pending = false;
+static char completion_tab_snapshot[INPUT_BUF_SIZE];
+static int completion_tab_snapshot_len = 0;
+static int completion_tab_snapshot_cursor = 0;
 
 extern void cmd_help(int argc, char **argv);
 extern void cmd_wifi(int argc, char **argv);
@@ -69,104 +73,310 @@ extern void cmd_hostname(int argc, char **argv);
 static void sshkey_reset_pending(void);
 
 static void completion_reset(void) {
-    completion_active = false;
     completion_count = 0;
-    completion_index = 0;
+    completion_context_argc = 0;
     completion_token_start = 0;
     completion_token_len = 0;
+    completion_tab_pending = false;
+    completion_tab_snapshot[0] = '\0';
+    completion_tab_snapshot_len = 0;
+    completion_tab_snapshot_cursor = 0;
 }
 
 static void redraw_input_line(void) {
     char spaces[INPUT_BUF_SIZE + 1];
     memset(spaces, ' ', sizeof(spaces) - 1);
     spaces[sizeof(spaces) - 1] = '\0';
+    const int clear_len = rendered_input_len > input_len ? rendered_input_len : input_len;
     terminal_write(term, "\r$ ", 3);
-    terminal_write(term, spaces, input_len);
+    if (clear_len > 0) terminal_write(term, spaces, clear_len);
     terminal_write(term, "\r$ ", 3);
-    terminal_write(term, input_buf, input_len);
+    if (input_callback && input_masked) {
+        if (input_len > 0) {
+            memset(spaces, '*', input_len);
+            terminal_write(term, spaces, input_len);
+        }
+    } else {
+        terminal_write(term, input_buf, input_len);
+    }
+    if (input_cursor < input_len) {
+        char seq[24];
+        const int move_left = input_len - input_cursor;
+        snprintf(seq, sizeof(seq), "\033[%dD", move_left);
+        terminal_write(term, seq, -1);
+    }
+    rendered_input_len = input_len;
 }
 
-static int completion_collect_wifi_connect(char out[][33], int max_entries, const char *prefix) {
-    for (int i = 0; i < max_entries; i++) out[i][0] = '\0';
-    char ssids[16][33];
-    const int count = wifi_mgr_get_saved_ssids(ssids, 16);
-    int n = 0;
-    for (int i = 0; i < count && n < max_entries; i++) {
-        if (!prefix || !prefix[0] || strncmp(ssids[i], prefix, strlen(prefix)) == 0) {
-            const size_t nlen = strnlen(ssids[i], 32);
-            memcpy(out[n], ssids[i], nlen);
-            out[n][nlen] = '\0';
-            n++;
+static bool completion_prefix_match(const char *candidate, const char *prefix) {
+    if (!candidate || !prefix) return false;
+    const size_t prefix_len = strlen(prefix);
+    return strncmp(candidate, prefix, prefix_len) == 0;
+}
+
+static void completion_sort_items(char items[][33], int count) {
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (strcmp(items[i], items[j]) > 0) {
+                char tmp[33];
+                memcpy(tmp, items[i], sizeof(tmp));
+                memcpy(items[i], items[j], sizeof(tmp));
+                memcpy(items[j], tmp, sizeof(tmp));
+            }
         }
     }
+}
+
+static void completion_add_item(char out[][33], int max_entries, int *count, const char *candidate, const char *prefix) {
+    if (!candidate || !count || *count >= max_entries) return;
+    if (!completion_prefix_match(candidate, prefix)) return;
+    const size_t nlen = strnlen(candidate, 32);
+    memcpy(out[*count], candidate, nlen);
+    out[*count][nlen] = '\0';
+    (*count)++;
+}
+
+static void completion_collect_saved_ssids(char out[][33], int max_entries, int *count, const char *prefix) {
+    char ssids[16][33];
+    const int saved_count = wifi_mgr_get_saved_ssids(ssids, 16);
+    for (int i = 0; i < saved_count && *count < max_entries; i++) {
+        completion_add_item(out, max_entries, count, ssids[i], prefix);
+    }
+}
+
+static int completion_collect_matches(char out[][33], int max_entries, const char *prefix, int context_argc, char **context_argv) {
+    for (int i = 0; i < max_entries; i++) out[i][0] = '\0';
+    int n = 0;
+
+    if (context_argc == 0) {
+        for (int i = 0; i < cmd_count && n < max_entries; i++) {
+            completion_add_item(out, max_entries, &n, cmd_table[i].name, prefix);
+        }
+        completion_sort_items(out, n);
+        return n;
+    }
+
+    const char *cmd = context_argv[0];
+    if (strcmp(cmd, "wifi") == 0) {
+        if (context_argc == 1) {
+            static const char *wifi_subcmds[] = {
+                "scan", "status", "list", "connect", "disconnect", "forget"
+            };
+            for (size_t i = 0; i < sizeof(wifi_subcmds) / sizeof(wifi_subcmds[0]) && n < max_entries; i++) {
+                completion_add_item(out, max_entries, &n, wifi_subcmds[i], prefix);
+            }
+            completion_sort_items(out, n);
+            return n;
+        }
+        if (context_argc == 2 &&
+            (strcmp(context_argv[1], "connect") == 0 || strcmp(context_argv[1], "forget") == 0)) {
+            completion_collect_saved_ssids(out, max_entries, &n, prefix);
+            completion_sort_items(out, n);
+            return n;
+        }
+        return 0;
+    }
+
+    if (strcmp(cmd, "sshkey") == 0 && context_argc == 1) {
+        static const char *sshkey_subcmds[] = {
+            "status", "import", "load", "clear", "erase"
+        };
+        for (size_t i = 0; i < sizeof(sshkey_subcmds) / sizeof(sshkey_subcmds[0]) && n < max_entries; i++) {
+            completion_add_item(out, max_entries, &n, sshkey_subcmds[i], prefix);
+        }
+        completion_sort_items(out, n);
+        return n;
+    }
+
+    if (strcmp(cmd, "tailscale") == 0) {
+        if (context_argc == 1) {
+            static const char *tailscale_subcmds[] = {
+                "enable", "disable", "backend", "set", "show", "ping", "up", "down", "status", "devices", "clear"
+            };
+            for (size_t i = 0; i < sizeof(tailscale_subcmds) / sizeof(tailscale_subcmds[0]) && n < max_entries; i++) {
+                completion_add_item(out, max_entries, &n, tailscale_subcmds[i], prefix);
+            }
+            completion_sort_items(out, n);
+            return n;
+        }
+        if (context_argc == 2 && strcmp(context_argv[1], "backend") == 0) {
+            static const char *backend_opts[] = {"saas", "headscale"};
+            for (size_t i = 0; i < sizeof(backend_opts) / sizeof(backend_opts[0]) && n < max_entries; i++) {
+                completion_add_item(out, max_entries, &n, backend_opts[i], prefix);
+            }
+            completion_sort_items(out, n);
+            return n;
+        }
+        if (context_argc == 2 && strcmp(context_argv[1], "set") == 0) {
+            static const char *set_opts[] = {"tailnet", "control-url", "authkey", "token"};
+            for (size_t i = 0; i < sizeof(set_opts) / sizeof(set_opts[0]) && n < max_entries; i++) {
+                completion_add_item(out, max_entries, &n, set_opts[i], prefix);
+            }
+            completion_sort_items(out, n);
+            return n;
+        }
+        if (context_argc == 2 && strcmp(context_argv[1], "show") == 0) {
+            static const char *show_opts[] = {"authkey", "token"};
+            for (size_t i = 0; i < sizeof(show_opts) / sizeof(show_opts[0]) && n < max_entries; i++) {
+                completion_add_item(out, max_entries, &n, show_opts[i], prefix);
+            }
+            completion_sort_items(out, n);
+            return n;
+        }
+        return 0;
+    }
+
+    if (strcmp(cmd, "hostname") == 0 && context_argc == 1) {
+        completion_add_item(out, max_entries, &n, "set", prefix);
+        completion_sort_items(out, n);
+        return n;
+    }
+
+    if (strcmp(cmd, "vault") == 0 && context_argc == 1) {
+        static const char *vault_subcmds[] = {"status", "rekey"};
+        for (size_t i = 0; i < sizeof(vault_subcmds) / sizeof(vault_subcmds[0]) && n < max_entries; i++) {
+            completion_add_item(out, max_entries, &n, vault_subcmds[i], prefix);
+        }
+        completion_sort_items(out, n);
+        return n;
+    }
+
+    if (strcmp(cmd, "mac") == 0 && context_argc == 1) {
+        completion_add_item(out, max_entries, &n, "set", prefix);
+        completion_sort_items(out, n);
+        return n;
+    }
+
+    completion_sort_items(out, n);
     return n;
 }
 
-static bool completion_try_begin(void) {
-    char line[INPUT_BUF_SIZE];
-    snprintf(line, sizeof(line), "%s", input_buf);
+static bool completion_try_begin(bool prefer_next_level_exact) {
+    if (input_cursor != input_len) return false;
 
-    const char *prefix_cmd = "wifi connect";
-    const size_t prefix_len = strlen(prefix_cmd);
-    if (strncmp(line, prefix_cmd, prefix_len) != 0) return false;
-    if (line[prefix_len] != '\0' && line[prefix_len] != ' ') return false;
+    const bool trailing_space = (input_len > 0 && input_buf[input_len - 1] == ' ');
 
-    if (line[prefix_len] == '\0') {
-        if (input_len < INPUT_BUF_SIZE - 1) {
-            input_buf[input_len++] = ' ';
-            input_buf[input_len] = '\0';
-            input_cursor = input_len;
-            snprintf(line, sizeof(line), "%s", input_buf);
-        } else {
-            return false;
+    int token_start = input_len;
+    if (!trailing_space) {
+        while (token_start > 0 && input_buf[token_start - 1] != ' ') {
+            token_start--;
         }
     }
 
-    completion_token_start = (int)prefix_len + 1;
-    completion_token_len = input_len - completion_token_start;
-    if (completion_token_len < 0) completion_token_len = 0;
+    int token_len = input_len - token_start;
+    if (token_len < 0 || token_len > 32) return false;
 
-    char token_buf[33];
-    if (completion_token_len > 32) return false;
-    memcpy(token_buf, input_buf + completion_token_start, completion_token_len);
-    token_buf[completion_token_len] = '\0';
+    char prefix[33];
+    memcpy(prefix, input_buf + token_start, token_len);
+    prefix[token_len] = '\0';
 
-    completion_count = completion_collect_wifi_connect(completion_items, 16, token_buf);
+    char context_buf[INPUT_BUF_SIZE];
+    if (token_start > 0) {
+        memcpy(context_buf, input_buf, token_start);
+    }
+    context_buf[token_start] = '\0';
+
+    char *context_argv[CMD_MAX_ARGS];
+    int context_argc = 0;
+    char *tok = strtok(context_buf, " ");
+    while (tok && context_argc < CMD_MAX_ARGS) {
+        context_argv[context_argc++] = tok;
+        tok = strtok(NULL, " ");
+    }
+
+    int match_count = completion_collect_matches(completion_items,
+                                                 sizeof(completion_items) / sizeof(completion_items[0]),
+                                                 prefix,
+                                                 context_argc,
+                                                 context_argv);
+
+    if (prefer_next_level_exact && !trailing_space && match_count == 1 && strcmp(completion_items[0], prefix) == 0) {
+        char next_context_buf[INPUT_BUF_SIZE];
+        snprintf(next_context_buf, sizeof(next_context_buf), "%s", input_buf);
+
+        char *next_context_argv[CMD_MAX_ARGS];
+        int next_context_argc = 0;
+        char *next_tok = strtok(next_context_buf, " ");
+        while (next_tok && next_context_argc < CMD_MAX_ARGS) {
+            next_context_argv[next_context_argc++] = next_tok;
+            next_tok = strtok(NULL, " ");
+        }
+
+        match_count = completion_collect_matches(completion_items,
+                                                 sizeof(completion_items) / sizeof(completion_items[0]),
+                                                 "",
+                                                 next_context_argc,
+                                                 next_context_argv);
+        token_start = input_len;
+        token_len = 0;
+        context_argc = next_context_argc;
+    }
+
+    completion_count = match_count;
+    completion_context_argc = context_argc;
+    completion_token_start = token_start;
+    completion_token_len = token_len;
     if (completion_count <= 0) return false;
-    completion_index = 0;
-    completion_active = completion_count > 1;
     return true;
 }
 
-static void completion_apply_current(void) {
-    if (completion_count <= 0) return;
-    const char *choice = completion_items[completion_index];
-    const int choice_len = strlen(choice);
-    const int before_len = completion_token_start;
-    const bool need_space = (choice_len + before_len + 1) < INPUT_BUF_SIZE;
+static void completion_apply_text(const char *text, bool append_space) {
+    if (!text) return;
+    const int text_len = strlen(text);
 
-    int new_len = before_len + choice_len;
-    memcpy(input_buf + completion_token_start, choice, choice_len);
-    if (need_space) input_buf[new_len++] = ' ';
+    int new_len = completion_token_start + text_len;
+    memcpy(input_buf + completion_token_start, text, text_len);
+    if (append_space && new_len < INPUT_BUF_SIZE - 1) input_buf[new_len++] = ' ';
     input_buf[new_len] = '\0';
     input_len = new_len;
     input_cursor = new_len;
     redraw_input_line();
 }
 
-static void completion_print_choices(void) {
-    if (completion_count <= 1) return;
+static int completion_common_prefix_len(void) {
+    if (completion_count <= 0) return 0;
+    int common = strlen(completion_items[0]);
+    for (int i = 1; i < completion_count; i++) {
+        int j = 0;
+        while (j < common && completion_items[0][j] == completion_items[i][j]) j++;
+        common = j;
+    }
+    return common;
+}
+
+static void completion_show_matches(void) {
+    if (completion_count <= 0) return;
     for (int i = 0; i < completion_count; i++) {
-        shell_print("\r\n    ");
-        shell_print(i == completion_index ? "> " : "  ");
+        shell_print("\r\n");
         shell_print(completion_items[i]);
     }
     shell_print("\r\n");
     redraw_input_line();
 }
 
+static void completion_arm_tab_pending(void) {
+    completion_tab_pending = true;
+    completion_tab_snapshot_len = input_len;
+    completion_tab_snapshot_cursor = input_cursor;
+    memcpy(completion_tab_snapshot, input_buf, input_len);
+    completion_tab_snapshot[input_len] = '\0';
+}
+
+static bool completion_is_tab_pending_same_line(void) {
+    if (!completion_tab_pending) return false;
+    if (completion_tab_snapshot_len != input_len) return false;
+    if (completion_tab_snapshot_cursor != input_cursor) return false;
+    return memcmp(completion_tab_snapshot, input_buf, input_len) == 0;
+}
+
 void shell_print(const char *text) {
     if (term) terminal_write(term, text, -1);
+}
+
+void shell_pump_ui(void) {
+    if (!term) return;
+    terminal_render(term);
+    lv_timer_handler();
 }
 
 void shell_register_cmd(const char *name, void (*handler)(int, char **)) {
@@ -185,6 +395,7 @@ void shell_get_input(void (*callback)(const char *)) {
     input_masked = false;
     input_len = 0;
     input_cursor = 0;
+    rendered_input_len = 0;
     input_buf[0] = '\0';
 }
 
@@ -194,6 +405,7 @@ void shell_get_hidden_input(void (*callback)(const char *)) {
     input_masked = true;
     input_len = 0;
     input_cursor = 0;
+    rendered_input_len = 0;
     input_buf[0] = '\0';
 }
 
@@ -241,6 +453,7 @@ static void clear_screen_and_prompt(void) {
     terminal_write(term, "\033[0m\033[?25h\033[?2004l\033[2J\033[H$ ", -1);
     input_len = 0;
     input_cursor = 0;
+    rendered_input_len = 0;
     input_buf[0] = '\0';
     history_idx = -1;
     input_masked = false;
@@ -252,6 +465,7 @@ static void prompt(bool leading_newline) {
     terminal_write(term, "$ ", -1);
     input_len = 0;
     input_cursor = 0;
+    rendered_input_len = 0;
     input_buf[0] = '\0';
     history_idx = -1;
     input_masked = false;
@@ -270,6 +484,22 @@ bool shell_is_ssh_active(void) {
 }
 
 void shell_handle_key(char c) {
+    if ((uint8_t)c == 0x80) {
+        terminal_scrollback_step(term, 1);
+        shell_pump_ui();
+        return;
+    }
+    if ((uint8_t)c == 0x81) {
+        terminal_scrollback_step(term, -1);
+        shell_pump_ui();
+        return;
+    }
+
+    if (terminal_scrollback_active(term)) {
+        terminal_scrollback_reset(term);
+        shell_pump_ui();
+    }
+
     if (ssh_active) {
         char buf[3];
         int n;
@@ -289,11 +519,29 @@ void shell_handle_key(char c) {
     if (c == '\b') {
         completion_reset();
         if (input_cursor > 0) {
-            terminal_write(term, "\b \b", 3);
             memmove(input_buf + input_cursor - 1, input_buf + input_cursor,
                     input_len - input_cursor + 1);
             input_len--;
             input_cursor--;
+            if (input_callback && input_masked && input_cursor == input_len) {
+                terminal_write(term, "\b \b", 3);
+                rendered_input_len = input_len;
+            } else {
+                redraw_input_line();
+            }
+        }
+    } else if ((uint8_t)c == 0x7F) {
+        completion_reset();
+        if (input_cursor < input_len) {
+            memmove(input_buf + input_cursor,
+                    input_buf + input_cursor + 1,
+                    input_len - input_cursor);
+            input_len--;
+            if (input_callback && input_masked) {
+                rendered_input_len = input_len;
+            } else {
+                redraw_input_line();
+            }
         }
     } else if (c == 0x1B) {
         completion_reset();
@@ -302,6 +550,7 @@ void shell_handle_key(char c) {
         input_masked = false;
         input_len = 0;
         input_cursor = 0;
+        rendered_input_len = 0;
         input_buf[0] = '\0';
         prompt(true);
     } else if (c == '\n' || c == '\r') {
@@ -313,6 +562,7 @@ void shell_handle_key(char c) {
             strcpy(cmd, input_buf);
             input_len = 0;
             input_cursor = 0;
+            rendered_input_len = 0;
             input_buf[0] = '\0';
             if (input_callback) {
                 void (*cb)(const char *) = input_callback;
@@ -328,12 +578,7 @@ void shell_handle_key(char c) {
             else prompt(false);
         }
     } else if (c == 0x1E) {
-        if (completion_active && completion_count > 1) {
-            completion_index = (completion_index + completion_count - 1) % completion_count;
-            completion_apply_current();
-            completion_print_choices();
-            return;
-        }
+        completion_reset();
         if (history_count == 0) return;
         if (history_idx == -1) {
             strcpy(history_draft, input_buf);
@@ -360,13 +605,9 @@ void shell_handle_key(char c) {
         strcpy(input_buf, history[history_idx]);
         input_len = new_len;
         input_cursor = new_len;
+        rendered_input_len = new_len;
     } else if (c == 0x1F) {
-        if (completion_active && completion_count > 1) {
-            completion_index = (completion_index + 1) % completion_count;
-            completion_apply_current();
-            completion_print_choices();
-            return;
-        }
+        completion_reset();
         if (history_idx == -1) return;
         const char *new_text;
         int new_len;
@@ -394,6 +635,7 @@ void shell_handle_key(char c) {
         strcpy(input_buf, new_text);
         input_len = new_len;
         input_cursor = new_len;
+        rendered_input_len = new_len;
     } else if (c == 0x1C) {
         completion_reset();
         if (input_cursor > 0) {
@@ -408,20 +650,62 @@ void shell_handle_key(char c) {
         }
     } else if (c == '\t') {
         if (input_callback) return;
-        if (!completion_try_begin()) {
+
+        if (completion_is_tab_pending_same_line()) {
+            if (!completion_try_begin(true)) {
+                completion_reset();
+                terminal_write(term, "\a", 1);
+                return;
+            }
+            completion_show_matches();
+            completion_tab_pending = false;
+            return;
+        }
+
+        if (!completion_try_begin(false)) {
+            completion_reset();
             terminal_write(term, "\a", 1);
             return;
         }
-        completion_apply_current();
-        if (completion_count > 1) completion_print_choices();
+
+        char current_prefix[33];
+        memcpy(current_prefix, input_buf + completion_token_start, completion_token_len);
+        current_prefix[completion_token_len] = '\0';
+
+        if (completion_count == 1) {
+            const bool exact_match = strcmp(completion_items[0], current_prefix) == 0;
+            const bool trailing_space = (input_len > 0 && input_buf[input_len - 1] == ' ');
+
+            if (exact_match) {
+                if (!trailing_space && completion_context_argc > 0) {
+                    completion_apply_text(completion_items[0], true);
+                }
+                completion_arm_tab_pending();
+                return;
+            }
+
+            completion_apply_text(completion_items[0], true);
+            completion_tab_pending = false;
+            return;
+        }
+
+        int common_len = completion_common_prefix_len();
+        if (common_len > completion_token_len) {
+            char common_prefix[33];
+            memcpy(common_prefix, completion_items[0], common_len);
+            common_prefix[common_len] = '\0';
+            completion_apply_text(common_prefix, false);
+        }
+        completion_arm_tab_pending();
     } else {
         completion_reset();
         if (input_len < INPUT_BUF_SIZE - 1) {
             char ch = c;
-            if (input_callback && input_masked) {
+            const bool insert_in_middle = input_cursor < input_len;
+            if (!insert_in_middle && input_callback && input_masked) {
                 char mask = '*';
                 terminal_write(term, &mask, 1);
-            } else {
+            } else if (!insert_in_middle) {
                 terminal_write(term, &ch, 1);
             }
             memmove(input_buf + input_cursor + 1, input_buf + input_cursor,
@@ -429,15 +713,34 @@ void shell_handle_key(char c) {
             input_buf[input_cursor] = c;
             input_len++;
             input_cursor++;
+            if (insert_in_middle) {
+                redraw_input_line();
+            } else {
+                rendered_input_len = input_len;
+            }
         }
     }
 }
 
 static void cmd_help_handler(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     shell_print("\r\n  Available commands:");
-    for (int i = 0; i < cmd_count; i++) {
+    const char *names[CMD_TABLE_SIZE];
+    int n = cmd_count < CMD_TABLE_SIZE ? cmd_count : CMD_TABLE_SIZE;
+    for (int i = 0; i < n; i++) names[i] = cmd_table[i].name;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (strcmp(names[i], names[j]) > 0) {
+                const char *tmp = names[i];
+                names[i] = names[j];
+                names[j] = tmp;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
         shell_print("\r\n    ");
-        shell_print(cmd_table[i].name);
+        shell_print(names[i]);
     }
     shell_print("\r\n");
 }
@@ -938,12 +1241,71 @@ static void cmd_ssh_handler(int argc, char **argv) {
     queue_ssh_connect("", true);
 }
 
+static bool parse_mac_string(const char *text, uint8_t mac[6]) {
+    if (!text || !mac) return false;
+    unsigned int b[6] = {0};
+    if (sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) {
+        if (b[i] > 0xFF) return false;
+        mac[i] = (uint8_t)b[i];
+    }
+    return true;
+}
+
+static void print_mac_line(const uint8_t mac[6]) {
+    char line[48];
+    snprintf(line,
+             sizeof(line),
+             "\r\n  %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0],
+             mac[1],
+             mac[2],
+             mac[3],
+             mac[4],
+             mac[5]);
+    shell_print(line);
+}
+
+static void cmd_mac_handler(int argc, char **argv) {
+    if (argc == 1) {
+        uint8_t mac[6] = {0};
+        esp_err_t err = wifi_mgr_get_mac(mac);
+        if (err != ESP_OK) {
+            shell_print("\r\n  mac unavailable");
+            return;
+        }
+        print_mac_line(mac);
+        return;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "set") == 0) {
+        uint8_t mac[6] = {0};
+        if (!parse_mac_string(argv[2], mac)) {
+            shell_print("\r\n  invalid mac format (use XX:XX:XX:XX:XX:XX)");
+            return;
+        }
+        esp_err_t err = wifi_mgr_set_mac(mac);
+        if (err != ESP_OK) {
+            shell_print("\r\n  failed to set mac (must be unicast, non-zero)");
+            return;
+        }
+        shell_print("\r\n  mac set:");
+        print_mac_line(mac);
+        return;
+    }
+
+    shell_print("\r\n  usage: mac | mac set <xx:xx:xx:xx:xx:xx>");
+}
+
 void shell_init(terminal_t *t) {
     term = t;
 
     input_buf[0] = '\0';
     input_len = 0;
     input_cursor = 0;
+    rendered_input_len = 0;
     history_count = 0;
     history_idx = -1;
     input_callback = NULL;
@@ -955,6 +1317,7 @@ void shell_init(terminal_t *t) {
     shell_register_cmd("sshkey", cmd_sshkey_handler);
     shell_register_cmd("tailscale", cmd_tailscale);
     shell_register_cmd("hostname", cmd_hostname);
+    shell_register_cmd("mac", cmd_mac_handler);
     shell_register_cmd("vault", cmd_vault);
     shell_register_cmd("about", cmd_about_handler);
 

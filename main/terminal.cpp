@@ -154,6 +154,60 @@ static term_cell_t *cell_ptr(terminal_t *term, int row, int col) {
     return &buf[row * term->cols + col];
 }
 
+static void mark_all_dirty(terminal_t *term) {
+    term_cell_t *buf = term->alt_screen ? term->alt : term->screen;
+    const int total = term->rows * term->cols;
+    for (int i = 0; i < total; i++) buf[i].dirty = 1;
+}
+
+static int scrollback_line_index(const terminal_t *term, int logical_idx) {
+    if (!term->scrollback || term->scrollback_count <= 0) return -1;
+    if (logical_idx < 0 || logical_idx >= term->scrollback_count) return -1;
+    return (term->scrollback_head + logical_idx) % term->scrollback_capacity;
+}
+
+static void scrollback_push_row(terminal_t *term, int row) {
+    if (!term->scrollback || term->alt_screen) return;
+    if (row < 0 || row >= term->rows) return;
+
+    term_cell_t *buf = term->alt_screen ? term->alt : term->screen;
+    term_cell_t *src = &buf[row * term->cols];
+
+    int dst_slot;
+    if (term->scrollback_count < term->scrollback_capacity) {
+        dst_slot = (term->scrollback_head + term->scrollback_count) % term->scrollback_capacity;
+        term->scrollback_count++;
+    } else {
+        dst_slot = term->scrollback_head;
+        term->scrollback_head = (term->scrollback_head + 1) % term->scrollback_capacity;
+    }
+
+    term_cell_t *dst = &term->scrollback[dst_slot * term->cols];
+    memcpy(dst, src, term->cols * sizeof(term_cell_t));
+    for (int c = 0; c < term->cols; c++) dst[c].dirty = 0;
+}
+
+static const term_cell_t *view_cell(const terminal_t *term,
+                                    const term_cell_t *screen_buf,
+                                    int render_row,
+                                    int col,
+                                    int view_offset) {
+    const int total_lines = term->scrollback_count + term->rows;
+    int start = total_lines - term->rows - view_offset;
+    if (start < 0) start = 0;
+    int line = start + render_row;
+
+    if (line < term->scrollback_count) {
+        int sb_idx = scrollback_line_index(term, line);
+        if (sb_idx >= 0) return &term->scrollback[sb_idx * term->cols + col];
+    }
+
+    int screen_row = line - term->scrollback_count;
+    if (screen_row < 0) screen_row = 0;
+    if (screen_row >= term->rows) screen_row = term->rows - 1;
+    return &screen_buf[screen_row * term->cols + col];
+}
+
 static void reset_cell(term_cell_t *c) {
     c->code = ' ';
     c->fg = RGB565_GREEN;
@@ -216,6 +270,8 @@ void terminal_init(terminal_t *term,
     size_t cell_size = rows * cols * sizeof(term_cell_t);
     term->screen = (term_cell_t *)heap_caps_malloc(cell_size, MALLOC_CAP_SPIRAM);
     term->alt = (term_cell_t *)heap_caps_malloc(cell_size, MALLOC_CAP_SPIRAM);
+    term->scrollback_capacity = TERM_SCROLLBACK_MAX_LINES;
+    term->scrollback = (term_cell_t *)heap_caps_malloc(term->scrollback_capacity * cols * sizeof(term_cell_t), MALLOC_CAP_SPIRAM);
 
     int cw = cols * term->font_w;
     int ch = rows * term->font_h;
@@ -227,6 +283,7 @@ void terminal_init(terminal_t *term,
     lv_obj_align(term->canvas, LV_ALIGN_TOP_LEFT, 0, 0);
 
     term->cursor_visible = true;
+    term->view_offset = 0;
     term->cursor_blink_phase = true;
     term->last_cursor_row = 0;
     term->last_cursor_col = 0;
@@ -257,6 +314,11 @@ static void scroll_region(terminal_t *term, int top, int bottom, int n) {
         return;
     }
     term_cell_t *buf = term->alt_screen ? term->alt : term->screen;
+    if (!term->alt_screen) {
+        for (int i = 0; i < n; i++) {
+            scrollback_push_row(term, top + i);
+        }
+    }
     size_t row_size = term->cols * sizeof(term_cell_t);
     size_t move_size = (h - n) * row_size;
     memmove(buf + top * term->cols, buf + (top + n) * term->cols, move_size);
@@ -1202,9 +1264,16 @@ void terminal_render(terminal_t *term) {
     if (!term->canvas) return;
 
     term_cell_t *buf = term->alt_screen ? term->alt : term->screen;
+    static int s_last_view_offset = -1;
+    const int view_offset = term->view_offset;
+    const bool showing_history = view_offset > 0;
+    if (s_last_view_offset != view_offset) {
+        mark_all_dirty(term);
+        s_last_view_offset = view_offset;
+    }
 
     bool blink_phase = ((lv_tick_get() / 500U) & 1U) == 0;
-    if (term->cursor_visible) {
+    if (term->cursor_visible && !showing_history) {
         if (term->last_cursor_row != term->cursor_row || term->last_cursor_col != term->cursor_col) {
             dirty_cell(term, term->last_cursor_row, term->last_cursor_col);
             dirty_cell(term, term->cursor_row, term->cursor_col);
@@ -1235,22 +1304,24 @@ void terminal_render(terminal_t *term) {
             term_cell_t *cp = &buf[r * term->cols + c];
             if (!cp->dirty) continue;
 
+            const term_cell_t *src = showing_history ? view_cell(term, buf, r, c, view_offset) : cp;
+
             int cell_x = c * term->font_w;
             int cell_y = r * term->font_h;
 
-            uint16_t bg = cp->bg;
+            uint16_t bg = src->bg;
             for (int py = cell_y; py < cell_y + term->font_h && py < ch; py++)
                 for (int px = cell_x; px < cell_x + term->font_w && px < cw; px++)
                     canvas[py * stride + px] = bg;
 
-            draw_cell_glyph(term, canvas, stride, cw, ch, cell_x, cell_y, cp->code, cp->fg, cp->bg);
+            draw_cell_glyph(term, canvas, stride, cw, ch, cell_x, cell_y, src->code, src->fg, src->bg);
 
             cp->dirty = 0;
         }
     }
 
     // Cursor
-    if (term->cursor_visible && term->cursor_blink_phase) {
+    if (term->cursor_visible && term->cursor_blink_phase && !showing_history) {
         int cr = term->cursor_row;
         int cc = term->cursor_col;
         if (cr >= 0 && cr < term->rows && cc >= 0 && cc < term->cols) {
@@ -1274,4 +1345,25 @@ void terminal_render(terminal_t *term) {
 
 void terminal_set_output_cb(terminal_t *term, void (*cb)(const char *, size_t)) {
     term->output_cb = cb;
+}
+
+void terminal_scrollback_step(terminal_t *term, int delta_lines) {
+    if (!term || term->scrollback_count <= 0) return;
+    int new_offset = term->view_offset + delta_lines;
+    if (new_offset < 0) new_offset = 0;
+    if (new_offset > term->scrollback_count) new_offset = term->scrollback_count;
+    if (new_offset == term->view_offset) return;
+    term->view_offset = new_offset;
+    mark_all_dirty(term);
+}
+
+void terminal_scrollback_reset(terminal_t *term) {
+    if (!term) return;
+    if (term->view_offset == 0) return;
+    term->view_offset = 0;
+    mark_all_dirty(term);
+}
+
+bool terminal_scrollback_active(const terminal_t *term) {
+    return term && term->view_offset > 0;
 }

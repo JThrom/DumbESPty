@@ -4,6 +4,38 @@ All notable changes to DumbESPty are documented in this file.
 
 ## [Unreleased]
 
+### Added (Shell/Wi-Fi) - 2026-06
+- New `mac` command for station MAC management:
+  - `mac` prints current STA MAC address (`XX:XX:XX:XX:XX:XX`).
+  - `mac set <xx:xx:xx:xx:xx:xx>` validates and applies a custom STA MAC for
+    captive-portal / MAC-clone workflows.
+- Wi-Fi manager now exposes MAC get/set helpers used by shell command paths.
+
+### Changed (Shell) - 2026-06
+- TAB completion now follows Bash-like behavior:
+  - single TAB completes unique matches,
+  - double TAB on unchanged input prints vertical candidate lists,
+  - command/subcommand/SSID suggestions are sorted alphabetically.
+- `help` command output is now sorted alphabetically.
+- Line editing fixes for backspace/delete/insert-at-cursor behavior; middle-line
+  edits now shift characters correctly with no stale trailing glyphs.
+- Added terminal scrollback view controls from keyboard:
+  - `Ctrl+Shift+Up` scrolls up one line,
+  - `Ctrl+Shift+Down` scrolls down one line,
+  - any regular key returns view to live bottom input.
+
+### Changed (Wi-Fi UX) - 2026-06
+- `wifi scan` now prints progress immediately (`scanning` + per-second dots),
+  then prints a vertical SSID list on completion.
+- `wifi connect <ssid>` now prints progress immediately (`connecting to <ssid>`
+  + per-second dots) and reports `connected as <ip>` when complete.
+- `wifi status` now reports `connected as <ip>` when IP is available.
+
+### Changed (UI) - 2026-06
+- Status drawer close button removed; outside-touch dismiss remains.
+- Drawer open gesture is now top-right-corner only (left-edge open removed).
+- Top-right drawer open hotzone enlarged for easier touch activation.
+
 ### Fixed (SSH) - 2026-06 Go server / terminal.shop compatibility
 - `ssh-ed25519` host key support added via the libssh2 fork
   (`../../libssh2_esp`): ed25519 hostkey verification implemented in the

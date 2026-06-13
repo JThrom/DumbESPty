@@ -41,6 +41,7 @@ typedef struct {
 
 static bool initialized = false;
 static bool scanning = false;
+static bool scan_done = false;
 static bool connected = false;
 static char scan_results[MAX_APS][33];
 static int scan_count = 0;
@@ -95,9 +96,16 @@ static bool check_current_ip(void) {
 
 static bool wait_for_ip_or_connected(int timeout_ms, const char *phase) {
     const int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    int64_t next_dot_us = esp_timer_get_time() + 1000000;
     while (esp_timer_get_time() < deadline_us) {
         if (connect_success || check_current_ip()) {
             return true;
+        }
+        int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_dot_us) {
+            shell_print(".");
+            shell_pump_ui();
+            next_dot_us += 1000000;
         }
         if (!connected) {
             vTaskDelay(pdMS_TO_TICKS(CONNECT_POLL_MS));
@@ -196,23 +204,14 @@ static void dump_scan_results(void) {
     }
 
     scan_count = ap_count;
-    char buf[256];
+    char buf[64];
+    shell_print("\r\n");
+    if (ap_count == 0) {
+        shell_print("(none)");
+    }
     for (int i = 0; i < ap_count; i++) {
         snprintf(scan_results[i], sizeof(scan_results[i]), "%s", (const char *)aps[i].ssid);
-        int rssi = aps[i].rssi;
-        const char *auth = "";
-        switch (aps[i].authmode) {
-            case WIFI_AUTH_OPEN: auth = "OPEN"; break;
-            case WIFI_AUTH_WEP: auth = "WEP"; break;
-            case WIFI_AUTH_WPA_PSK: auth = "WPA"; break;
-            case WIFI_AUTH_WPA2_PSK: auth = "WPA2"; break;
-            case WIFI_AUTH_WPA_WPA2_PSK: auth = "WPA/WPA2"; break;
-            case WIFI_AUTH_WPA2_ENTERPRISE: auth = "WPA2-E"; break;
-            case WIFI_AUTH_WPA3_PSK: auth = "WPA3"; break;
-            case WIFI_AUTH_WPA2_WPA3_PSK: auth = "WPA2/WPA3"; break;
-            default: auth = "?"; break;
-        }
-        snprintf(buf, sizeof(buf), "\r\n  %.32s  %-8s  %d dBm", scan_results[i], auth, rssi);
+        snprintf(buf, sizeof(buf), "\r\n%.32s", scan_results[i]);
         shell_print(buf);
     }
     free(aps);
@@ -237,6 +236,10 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         if (disc) {
             ESP_LOGW(TAG, "STA disconnected reason=%u", (unsigned)disc->reason);
         }
+        return;
+    }
+    if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
+        scan_done = true;
         return;
     }
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -315,6 +318,39 @@ esp_err_t wifi_mgr_apply_hostname(const char *hostname) {
     return esp_netif_set_hostname(s_sta_netif, hostname);
 }
 
+esp_err_t wifi_mgr_get_mac(uint8_t mac[6]) {
+    if (!mac) return ESP_ERR_INVALID_ARG;
+    if (!initialized) return ESP_ERR_INVALID_STATE;
+    return esp_wifi_get_mac(WIFI_IF_STA, mac);
+}
+
+esp_err_t wifi_mgr_set_mac(const uint8_t mac[6]) {
+    if (!mac) return ESP_ERR_INVALID_ARG;
+    if (!initialized) return ESP_ERR_INVALID_STATE;
+
+    if ((mac[0] & 0x01) != 0) return ESP_ERR_INVALID_ARG;
+    bool all_zero = true;
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    if (all_zero) return ESP_ERR_INVALID_ARG;
+
+    bool was_connected = connected;
+    if (was_connected) {
+        esp_wifi_disconnect();
+        connected = false;
+    }
+
+    esp_err_t ret = esp_wifi_set_mac(WIFI_IF_STA, (uint8_t *)mac);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "set mac failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 void wifi_mgr_process_queue(void) {
     if (!wifi_msg_queue) return;
     wifi_msg_t msg;
@@ -329,16 +365,39 @@ esp_err_t wifi_mgr_scan(void) {
         return ESP_ERR_INVALID_STATE;
     }
     scanning = true;
-    shell_print("\r\n  scanning...");
+    scan_done = false;
+    shell_print("\r\n  scanning");
+    shell_pump_ui();
     wifi_scan_config_t conf = {};
     conf.show_hidden = false;
     conf.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-    esp_err_t ret = esp_wifi_scan_start(&conf, true);
+    esp_err_t ret = esp_wifi_scan_start(&conf, false);
     if (ret != ESP_OK) {
         scanning = false;
+        scan_done = false;
         shell_print("\r\n  scan failed");
         return ret;
     }
+
+    int64_t next_dot_us = esp_timer_get_time() + 1000000;
+    const int64_t deadline_us = esp_timer_get_time() + 30000000;
+    while (!scan_done && esp_timer_get_time() < deadline_us) {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_dot_us) {
+            shell_print(".");
+            shell_pump_ui();
+            next_dot_us += 1000000;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (!scan_done) {
+        scanning = false;
+        shell_print("\r\n  scan timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    scan_done = false;
     dump_scan_results();
     return ESP_OK;
 }
@@ -358,6 +417,7 @@ bool wifi_mgr_connect(const char *ssid, const char *password) {
 
     shell_print("\r\n  connecting to ");
     shell_print(ssid);
+    shell_pump_ui();
 
     coex_acquire();
 
@@ -380,7 +440,7 @@ bool wifi_mgr_connect(const char *ssid, const char *password) {
     char buf[64];
     if (wait_for_ip_or_connected(CONNECT_TIMEOUT_MS, "connect phase1")) {
         if (connect_ip[0]) {
-            snprintf(buf, sizeof(buf), "\r\n  IP: %s", connect_ip);
+            snprintf(buf, sizeof(buf), "\r\n  connected as %s", connect_ip);
             shell_print(buf);
             shell_print("\r\n");
         }
@@ -388,14 +448,14 @@ bool wifi_mgr_connect(const char *ssid, const char *password) {
         return true;
     }
 
-    shell_print("\r\n  retrying...");
-    shell_print("\r\n");
+    shell_print("\r\n  retrying");
+    shell_pump_ui();
     connect_success = false;
     connect_ip[0] = '\0';
     ret = esp_wifi_connect();
     if (ret == ESP_OK && wait_for_ip_or_connected(CONNECT_RETRY_TIMEOUT_MS, "connect phase2")) {
         if (connect_ip[0]) {
-            snprintf(buf, sizeof(buf), "\r\n  IP: %s", connect_ip);
+            snprintf(buf, sizeof(buf), "\r\n  connected as %s", connect_ip);
             shell_print(buf);
             shell_print("\r\n");
         }
@@ -535,7 +595,11 @@ const char *wifi_mgr_get_ssid(void) {
 
 void wifi_mgr_get_status(char *buf, size_t len) {
     if (connected) {
-        snprintf(buf, len, "connected to %s", current_ssid);
+        if (check_current_ip() && connect_ip[0]) {
+            snprintf(buf, len, "connected as %s", connect_ip);
+        } else {
+            snprintf(buf, len, "connected");
+        }
     } else {
         snprintf(buf, len, "disconnected");
     }
