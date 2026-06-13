@@ -142,10 +142,22 @@ Stability hardening:
 ### Shell (`main/shell.cpp`, `main/shell.hpp`)
 
 - Local command processing (`help`, `wifi`, `ssh`, etc.)
+- Local MAC management command for captive-portal / MAC-clone workflows:
+  - `mac`
+  - `mac set <xx:xx:xx:xx:xx:xx>`
 - SSH passthrough mode toggling
 - Password capture callback support (deferred until required by auth probe)
 - `sshkey` shell command adds vault-backed private-key import/load and runtime key management
 - Escape/arrow/backspace handling integrated with terminal write path
+- Bash-like TAB completion behavior with alphabetized command/subcommand/SSID
+  candidate lists and double-TAB candidate display
+- `help` output sorted alphabetically
+- Line-editing behavior corrected for cursor-middle insert/delete and
+  backspace/delete shift semantics
+- Scrollback view controls:
+  - `Ctrl+Shift+Up` (line up)
+  - `Ctrl+Shift+Down` (line down)
+  - any regular key returns to bottom/live input
 
 ### BLE HID Host (`main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`)
 
@@ -163,6 +175,8 @@ Stability hardening:
 ### Status Menu UI (`main/ui_status_menu.cpp`, `main/ui_status_menu.hpp`)
 
 - Touch-open status drawer with outside-tap dismiss
+- Open gesture is top-right-corner touch zone only
+- Dedicated close button removed (outside-touch dismiss retained)
 - Dark-themed Wi-Fi/BLE controls
 - BLE flow:
   - `Scan` shown when unpaired,
@@ -177,6 +191,10 @@ Stability hardening:
 
 - Station mode setup and connection lifecycle
 - Event-driven connectivity state updates for SSH availability
+- Shell UX progress output for blocking scan/connect actions
+  (`scanning...` / `connecting...` with per-second dot updates)
+- Status string reports connected IP when available (`connected as <ip>`)
+- STA MAC get/set support for shell-level MAC-clone workflows
 
 ## Font and Glyph Assets
 

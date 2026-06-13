@@ -107,6 +107,22 @@ Phase 5 - Linux-like UX Polish
   - retain DSR replies in parser and SSH fast path.
 - Glyph fallback remaps expanded for observed Nerd Font gaps.
 - Private-use icon codepoints (Nerd Font ranges) now bypass Cozette bitmap lookup so Nerd symbols are preferred.
+- Shell usability updates:
+  - Bash-like TAB completion behavior (single TAB complete, double TAB list),
+  - alphabetized command/subcommand/SSID suggestions,
+  - alphabetized `help` output,
+  - fixed in-line editing for middle-of-line backspace/delete,
+  - keyboard scrollback view via `Ctrl+Shift+Up/Down`.
+- Wi-Fi shell UX updates:
+  - `wifi scan` and `wifi connect` now show immediate progress with per-second dots,
+  - `wifi status` reports `connected as <ip>` when available.
+- New MAC cloning command flow for captive-portal environments:
+  - `mac` shows current STA MAC,
+  - `mac set <xx:xx:xx:xx:xx:xx>` validates and applies a custom STA MAC.
+- Status drawer interaction updates:
+  - no dedicated close button (outside-touch closes),
+  - open gesture restricted to top-right touch zone,
+  - enlarged top-right touch zone for easier activation.
 
 ## Go SSH Server Compatibility Fixes (2026-06)
 
@@ -159,7 +175,7 @@ Current note:
 
 ## Status Menu and BLE Usage
 
-1. Open the status menu from the top status strip touch area.
+1. Open the status menu from the top-right corner touch area.
 2. If no keyboard is paired:
    - Tap `Scan`.
    - Tap a `Keyboard #` result to pair/connect.

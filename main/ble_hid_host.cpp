@@ -15,6 +15,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -352,6 +353,57 @@ static const char hid_to_ascii[] = {
 static const char shift_to[] = "!@#$%^&*()_+{}|:\"<>?~";
 static uint8_t s_prev_keys[6] = {0};
 static uint8_t s_prev_short_flags = 0;
+static uint8_t s_repeat_keycode = 0;
+static uint8_t s_repeat_modifier = 0;
+static int64_t s_repeat_next_us = 0;
+static bool s_repeat_active = false;
+
+static constexpr int64_t KEY_REPEAT_INITIAL_DELAY_US = 400000;
+static constexpr int64_t KEY_REPEAT_INTERVAL_US = 60000;
+
+static void repeat_reset(void) {
+    s_repeat_keycode = 0;
+    s_repeat_modifier = 0;
+    s_repeat_next_us = 0;
+    s_repeat_active = false;
+}
+
+static bool key_is_held(const uint8_t keys[6], uint8_t keycode) {
+    if (!keycode) return false;
+    for (int i = 0; i < 6; i++) {
+        if (keys[i] == keycode) return true;
+    }
+    return false;
+}
+
+static void repeat_update_from_report(uint8_t modifier, const uint8_t keys[6]) {
+    uint8_t first_key = 0;
+    for (int i = 0; i < 6; i++) {
+        if (keys[i] != 0) {
+            first_key = keys[i];
+            break;
+        }
+    }
+
+    if (first_key == 0) {
+        repeat_reset();
+        return;
+    }
+
+    if (!s_repeat_active || s_repeat_keycode != first_key || s_repeat_modifier != modifier) {
+        s_repeat_active = true;
+        s_repeat_keycode = first_key;
+        s_repeat_modifier = modifier;
+        s_repeat_next_us = esp_timer_get_time() + KEY_REPEAT_INITIAL_DELAY_US;
+        return;
+    }
+
+    if (!key_is_held(keys, s_repeat_keycode)) {
+        repeat_reset();
+    }
+}
+
+static void maybe_emit_key_repeat(void);
 
 static void bump_scan_generation(void) {
     portENTER_CRITICAL(&scan_lock);
@@ -696,6 +748,7 @@ static void update_key(char c) {
 }
 
 void ble_hid_process_queue(void) {
+    maybe_emit_key_repeat();
     if (!msg_queue) return;
     disp_msg_t msg;
     while (xQueueReceive(msg_queue, &msg, 0) == pdTRUE) {
@@ -733,10 +786,17 @@ static bool dispatch_keycode(uint8_t modifier, uint8_t keycode) {
         ESP_LOGI(TAG, "BLE keycode ESC detected");
     }
 
+    const bool shift = (modifier & 0x22) != 0;
+    const bool ctrl = (modifier & 0x11) != 0;
+
+    if (ctrl && shift && keycode == 0x52) { update_key((char)0x80); return true; } // Ctrl+Shift+Up (scroll up)
+    if (ctrl && shift && keycode == 0x51) { update_key((char)0x81); return true; } // Ctrl+Shift+Down (scroll down)
+
     if (keycode == 0x52) { update_key(0x1E); return true; } // Up
     if (keycode == 0x51) { update_key(0x1F); return true; } // Down
     if (keycode == 0x4F) { update_key(0x1D); return true; } // Right
     if (keycode == 0x50) { update_key(0x1C); return true; } // Left
+    if (keycode == 0x4C) { update_key(0x7F); return true; } // Delete
     if (keycode == 0x54) { update_key('/'); return true; }  // Keypad /
     if (keycode == 0x58) { update_key('\r'); return true; } // Keypad Enter
 
@@ -750,9 +810,6 @@ static bool dispatch_keycode(uint8_t modifier, uint8_t keycode) {
         ESP_LOGI(TAG, "no-ascii keycode=0x%02X mod=0x%02X", keycode, modifier);
         return false;
     }
-
-    bool shift = modifier & 0x22;
-    bool ctrl = modifier & 0x11;
 
     if (ctrl) {
         if (c >= 'a' && c <= 'z') {
@@ -777,6 +834,19 @@ static bool dispatch_keycode(uint8_t modifier, uint8_t keycode) {
 
     update_key(c);
     return true;
+}
+
+static void maybe_emit_key_repeat(void) {
+    if (!s_repeat_active) return;
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us < s_repeat_next_us) return;
+
+    if (!dispatch_keycode(s_repeat_modifier, s_repeat_keycode)) {
+        repeat_reset();
+        return;
+    }
+
+    s_repeat_next_us = now_us + KEY_REPEAT_INTERVAL_US;
 }
 
 static bool handle_kbd_report(const uint8_t *data, uint16_t len) {
@@ -857,6 +927,7 @@ static bool handle_kbd_report(const uint8_t *data, uint16_t len) {
             }
         }
 
+        repeat_update_from_report(modifier, cur_keys);
         memcpy(s_prev_keys, cur_keys, sizeof(s_prev_keys));
         return emitted_key;
     }
@@ -878,7 +949,7 @@ static bool handle_kbd_report(const uint8_t *data, uint16_t len) {
 
     uint8_t modifier = data[short_off + 0];
     uint8_t keycode = data[short_off + 2];
-    if (keycode == 0) {
+        if (keycode == 0) {
         if (len == 3 && data[0] == 0x00 && data[2] == 0x00) {
             /*
              * IMPORTANT (FN+ESC compatibility):
@@ -899,6 +970,7 @@ static bool handle_kbd_report(const uint8_t *data, uint16_t len) {
                 return true;
             }
             s_prev_short_flags = flags;
+            repeat_reset();
         }
 
         bool any_non_zero = false;
@@ -920,6 +992,10 @@ static bool handle_kbd_report(const uint8_t *data, uint16_t len) {
              (unsigned)short_off,
              modifier,
              keycode);
+    s_repeat_active = true;
+    s_repeat_keycode = keycode;
+    s_repeat_modifier = modifier;
+    s_repeat_next_us = esp_timer_get_time() + KEY_REPEAT_INITIAL_DELAY_US;
     return dispatch_keycode(modifier, keycode);
 }
 
@@ -1074,6 +1150,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                 conn_handle = event->connect.conn_handle;
                 memset(s_prev_keys, 0, sizeof(s_prev_keys));
                 s_prev_short_flags = 0;
+                repeat_reset();
                 scan_active = false;
                 hid_configured = false;
                 s_notify_rx_count = 0;
@@ -1101,6 +1178,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                 }
             } else {
                 conn_handle = 0xFFFF;
+                repeat_reset();
                 connected_name[0] = '\0';
                 ESP_LOGW(TAG,
                          "connect failed, status=%d(%s)",
@@ -1127,6 +1205,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             s_security_requested = false;
             memset(s_prev_keys, 0, sizeof(s_prev_keys));
             s_prev_short_flags = 0;
+            repeat_reset();
             connected_name[0] = '\0';
             bump_scan_generation();
             if (auto_reconnect && has_paired_prefix) {
@@ -1460,6 +1539,7 @@ static void nimble_reset_cb(int reason) {
     s_decode_drop_count = 0;
     s_security_requested = false;
     conn_handle = 0xFFFF;
+    repeat_reset();
     connected_name[0] = '\0';
     pending_connect_name[0] = '\0';
     if (manual_scan_mode) {
@@ -1509,6 +1589,7 @@ void ble_hid_host_disconnect(void) {
     s_security_requested = false;
     memset(s_prev_keys, 0, sizeof(s_prev_keys));
     s_prev_short_flags = 0;
+    repeat_reset();
     connected_name[0] = '\0';
     bump_scan_generation();
 }

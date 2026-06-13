@@ -17,6 +17,8 @@ void     wifi_mgr_get_status(char *buf, size_t len);
 void     wifi_mgr_process_queue(void);
 int      wifi_mgr_get_saved_ssids(char out[][33], int max_entries);
 esp_err_t wifi_mgr_apply_hostname(const char *hostname);
+esp_err_t wifi_mgr_get_mac(uint8_t mac[6]);
+esp_err_t wifi_mgr_set_mac(const uint8_t mac[6]);
 
 #ifdef __cplusplus
 }

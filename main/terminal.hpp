@@ -12,6 +12,7 @@ extern "C" {
 
 #define TERM_MAX_ROWS 128
 #define TERM_MAX_COLS 256
+#define TERM_SCROLLBACK_MAX_LINES 256
 
 typedef struct {
     uint32_t code;
@@ -42,6 +43,7 @@ struct terminal_t {
     bool application_cursor_keys;
     bool alt_screen;
     bool cursor_dirty;
+    int view_offset;
 
     uint16_t cur_fg, cur_bg;
     unsigned cur_bold : 1;
@@ -83,6 +85,11 @@ struct terminal_t {
     int last_cursor_row;
     int last_cursor_col;
 
+    term_cell_t *scrollback;
+    int scrollback_capacity;
+    int scrollback_count;
+    int scrollback_head;
+
     void (*output_cb)(const char *data, size_t len);
 };
 
@@ -98,6 +105,9 @@ void terminal_init(terminal_t *term,
 void terminal_write(terminal_t *term, const char *data, size_t len);
 void terminal_render(terminal_t *term);
 void terminal_set_output_cb(terminal_t *term, void (*cb)(const char *, size_t));
+void terminal_scrollback_step(terminal_t *term, int delta_lines);
+void terminal_scrollback_reset(terminal_t *term);
+bool terminal_scrollback_active(const terminal_t *term);
 
 #ifdef __cplusplus
 }
