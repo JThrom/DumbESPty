@@ -1,11 +1,20 @@
 #include "terminal.hpp"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 
 static const char *TAG = "TERM";
+
+/* Serializes terminal_write() across tasks. The parser is a stateful
+ * byte-stream machine; concurrent writers (e.g. shell task printing the
+ * post-connect clear while the main loop feeds SSH RX data) interleave
+ * bytes mid-escape-sequence and corrupt parsing (observed: OSC swallowed,
+ * CSI params clobbered, query replies lost). */
+static SemaphoreHandle_t s_term_write_lock = NULL;
 static int s_csi_trace_budget = 600;
 static int s_missing_glyph_budget = 32;
 
@@ -187,6 +196,9 @@ void terminal_init(terminal_t *term,
                    const cozette_bdf_font_t *bitmap_font,
                    const lv_font_t *font,
                    const lv_font_t *fallback_font) {
+    if (!s_term_write_lock) {
+        s_term_write_lock = xSemaphoreCreateMutex();
+    }
     memset(term, 0, sizeof(*term));
     term->bitmap_font = bitmap_font;
     term->font = font;
@@ -745,7 +757,24 @@ static void csi_dispatch(terminal_t *term) {
 }
 
 static void osc_dispatch(terminal_t *term) {
-    // Ignore OSC sequences (window title, etc.)
+    // Most OSC sequences (window title, etc.) are ignored, but TUI apps
+    // (bubbletea/lipgloss, e.g. terminal.shop) query terminal colors at
+    // startup and wait for replies before drawing anything:
+    //   OSC 10 ; ? -> report default foreground color
+    //   OSC 11 ; ? -> report default background color
+    // Reply with the terminal's default palette (green on black).
+    if (!term->output_cb || term->osc_len < 4) return;
+
+    term->osc_buf[term->osc_len < 255 ? term->osc_len : 255] = '\0';
+    const char *s = (const char *)term->osc_buf;
+
+    if (strncmp(s, "10;?", 4) == 0) {
+        static const char fg_reply[] = "\033]10;rgb:0000/ffff/0000\033\\";
+        term->output_cb(fg_reply, sizeof(fg_reply) - 1);
+    } else if (strncmp(s, "11;?", 4) == 0) {
+        static const char bg_reply[] = "\033]11;rgb:0000/0000/0000\033\\";
+        term->output_cb(bg_reply, sizeof(bg_reply) - 1);
+    }
 }
 
 static void parse_char(terminal_t *term, uint8_t c);
@@ -1003,6 +1032,10 @@ static void parse_char(terminal_t *term, uint8_t c) {
 
     case ST_OSC:
         if (c == 0x1B) {
+            // ESC here is (almost always) the start of the ST terminator
+            // (ESC \). Dispatch the accumulated OSC string before leaving
+            // the state so ST-terminated queries (OSC 10/11) get replies.
+            osc_dispatch(term);
             term->state = ST_ESC;
         } else if (c == 0x9C) {
             osc_dispatch(term);
@@ -1023,8 +1056,18 @@ static void parse_char(terminal_t *term, uint8_t c) {
 
 void terminal_write(terminal_t *term, const char *data, size_t len) {
     if (len == (size_t)-1) len = strlen(data);
+
+    bool locked = false;
+    if (s_term_write_lock) {
+        locked = (xSemaphoreTake(s_term_write_lock, pdMS_TO_TICKS(5000)) == pdTRUE);
+    }
+
     for (size_t i = 0; i < len; i++)
         parse_char(term, (uint8_t)data[i]);
+
+    if (locked) {
+        xSemaphoreGive(s_term_write_lock);
+    }
 }
 
 static void draw_cell_glyph(const terminal_t *term,

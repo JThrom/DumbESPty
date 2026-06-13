@@ -43,15 +43,35 @@ Primary integration goal in the current phase: keep LazyVim rendering stable whi
   - supports `none` probe,
   - supports `keyboard-interactive` fallback,
   - prompts for password only when password-style auth is actually required.
-- Known hard limitation in current libssh2+mbedTLS build:
-  - client does not support `ssh-ed25519` host keys,
-  - servers that offer only `ssh-ed25519` fail during handshake (`Unable to exchange encryption keys`).
+- SSH now attempts auth in Linux-like order when methods are offered:
+  - `none` -> `publickey` (when a key is loaded) -> `keyboard-interactive`/`password`.
+- SSH connect diagnostics now include:
+  - dynamic hostkey preference ordering across available `ssh-ed25519`/ECDSA/RSA algorithms,
+  - server hostkey fingerprint logging (SHA1) as groundwork for future `known_hosts` pinning.
+- Host trust now has an initial TOFU check:
+  - first-seen host fingerprint is stored,
+  - mismatched future fingerprint for same `host:port` is refused.
+- `ssh-ed25519` host keys are now supported (2026-06):
+  - implemented in the libssh2 fork's mbedTLS backend via vendored ref10
+    ed25519 verification,
+  - ed25519-only servers (e.g. `terminal.shop`) handshake successfully.
+- Go-based SSH servers (x/crypto/ssh, wish/charm, e.g. `terminal.shop`) are
+  now fully compatible:
+  - terminal dimensions are sent inside `pty-req`
+    (`libssh2_channel_request_pty_ex`); no separate `window-change` request
+    is sent during session startup (it wedges Go servers' request loop),
+  - terminal answers bubbletea/lipgloss startup probes (`OSC 10;?`,
+    `OSC 11;?`, `CSI 6n`, `CSI c`) so TUI apps draw instead of waiting
+    forever,
+  - `terminal_write` is mutex-serialized so concurrent writers cannot
+    corrupt escape-sequence parsing.
 
 ## SSH Compatibility Roadmap (Phased)
 
-Phase 1 - Host Key Compatibility (highest priority)
-- Enable `ssh-ed25519` host key support in the device SSH stack.
-- Keep ECDSA/RSA host key compatibility.
+Phase 1 - Host Key Compatibility (DONE 2026-06)
+- `ssh-ed25519` host key support enabled in the device SSH stack
+  (libssh2 fork, ref10 verify in mbedTLS backend).
+- ECDSA/RSA host key compatibility retained.
 
 Phase 2 - Auth Method Matrix
 - Ensure robust method negotiation across `publickey`, `keyboard-interactive`, `password`, and `none`.
@@ -87,6 +107,33 @@ Phase 5 - Linux-like UX Polish
   - retain DSR replies in parser and SSH fast path.
 - Glyph fallback remaps expanded for observed Nerd Font gaps.
 - Private-use icon codepoints (Nerd Font ranges) now bypass Cozette bitmap lookup so Nerd symbols are preferred.
+
+## Go SSH Server Compatibility Fixes (2026-06)
+
+`ssh terminal.shop` (Go server, ed25519-only host key, bubbletea TUI) now
+works end-to-end. Three bugs were fixed, each verified with a host-side
+Linux build of the forked libssh2 against the live server:
+
+1. `ssh-ed25519` host key support (Phase 1 complete):
+   - vendored ref10 ed25519 verification added to the libssh2 fork's
+     mbedTLS backend (`../../libssh2_esp`, used via `override_path`),
+   - fork also propagates specific KEX failure reasons instead of the
+     generic `-8 Unable to exchange encryption keys`.
+2. Channel-startup ordering:
+   - a `window-change` request between `pty-req` and `shell` causes Go
+     SSH servers to stop answering channel requests entirely,
+   - dimensions now ride inside `pty-req` via
+     `libssh2_channel_request_pty_ex`; startup window-change requests
+     removed.
+3. Terminal startup probes and parser thread safety:
+   - OSC 10/11 color queries are answered and ST-terminated OSC strings
+     dispatch correctly, unblocking bubbletea/lipgloss apps,
+   - `terminal_write` is mutex-serialized; previously the SSH connect
+     task and main loop interleaved bytes mid-escape-sequence, corrupting
+     queries and dropping replies.
+
+Note: the libssh2 fork carries the ed25519/kex patches as local changes;
+commit or vendor that tree for reproducible builds.
 
 ## Recent SSH/Tailnet Stabilization (2026-05)
 
@@ -167,6 +214,7 @@ Core modules in active use:
 - `main/shell.cpp`, `main/shell.hpp`
 - `main/wifi_mgr.cpp`, `main/wifi_mgr.hpp`
 - `main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`
+- `main/secret_vault.cpp`, `main/secret_vault.hpp`
 - `main/coex_manager.cpp`, `main/coex_manager_stub.cpp`, `main/coex_manager.hpp`
 - `main/waveshare_display_p4.cpp`, `main/include/waveshare_display.hpp`
 - `main/ch422g_init.cpp`, `main/include/ch422g_init.hpp`
@@ -192,6 +240,10 @@ Implemented compatibility areas:
 - DECRQM response (`CSI ? Ps $ p` -> `CSI ? Ps;0$y`)
 - Distinct `CSI ?u` handling vs restore-cursor `CSI u`
 - Keypad mode escapes `ESC >` / `ESC =`
+- OSC 10/11 color query replies (default palette) for bubbletea/lipgloss
+  TUI startup probing
+- ST-terminated (`ESC \`) OSC dispatch
+- Thread-safe `terminal_write` (mutex-serialized parser input)
 
 Rendering notes:
 
@@ -212,8 +264,13 @@ Rendering notes:
   - server auth-method probe before prompting,
   - `keyboard-interactive` auth support,
   - deferred password prompt when password-style auth is required.
-- Current limitation:
-  - `ssh-ed25519` host key negotiation is not available in current libssh2+mbedTLS build.
+- Host key support: `ssh-ed25519` (via libssh2 fork), ECDSA, RSA.
+- PTY startup: dimensions sent inside `pty-req`
+  (`libssh2_channel_request_pty_ex`); no separate `window-change` during
+  session startup (Go SSH server compatibility).
+- Known limitation: `curve25519-sha256` KEX requires PSA crypto
+  (`MBEDTLS_PSA_CRYPTO_C`), not enabled in ESP-IDF mbedTLS config; the
+  conservative profile negotiates `ecdh-sha2-nistp256` instead.
 
 ### Shell (`main/shell.cpp`, `main/shell.hpp`)
 
@@ -221,6 +278,7 @@ Rendering notes:
 - SSH passthrough mode toggling
 - SSH target parsing supports both `user@host` and host-only forms
 - Password capture callback (only when method probe indicates it is needed)
+- `sshkey` command supports vault-backed key import/load/clear for SSH publickey auth
 - Escape/arrow/backspace behavior integrated with terminal output
 
 ### BLE HID Host (`main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`)
@@ -346,16 +404,11 @@ ESP32-P4 bring-up note (important):
    - Reproduced with both `TERM=xterm` and `TERM=xterm-256color` using `nvim --clean`.
    - Detailed attempt history and rollback notes are tracked in `SPEC.md`.
 
-2. SSH host key compatibility gap
-   - Current client build lacks `ssh-ed25519` host key support.
-   - ed25519-only servers fail at handshake.
-   - Highest-priority item in phased SSH roadmap.
-
-3. Nerd Font gaps
+2. Nerd Font gaps
    - Missing codepoints may still appear in future runs.
    - Add exact new `U+....` values to symbol font range as observed.
 
-4. DCS parser regression risk
+3. DCS parser regression risk
    - Prior XTGETTCAP DCS state-machine experiment regressed LazyVim rendering and was reverted.
 
 ## Regressions to Avoid

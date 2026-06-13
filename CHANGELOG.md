@@ -4,17 +4,65 @@ All notable changes to DumbESPty are documented in this file.
 
 ## [Unreleased]
 
+### Fixed (SSH) - 2026-06 Go server / terminal.shop compatibility
+- `ssh-ed25519` host key support added via the libssh2 fork
+  (`../../libssh2_esp`): ed25519 hostkey verification implemented in the
+  mbedTLS backend with vendored ref10 code. ed25519-only servers
+  (e.g. `terminal.shop`) now handshake successfully (SSH roadmap Phase 1).
+- libssh2 fork now propagates specific KEX failure codes/messages instead of
+  the generic `-8 Unable to exchange encryption keys`, including client/server
+  algorithm lists on negotiation mismatch.
+- PTY startup no longer sends a separate `window-change` request between
+  `pty-req` and `shell`; terminal dimensions are passed inside `pty-req`
+  via `libssh2_channel_request_pty_ex`. The old ordering wedged Go-based
+  SSH servers (x/crypto/ssh, wish/charm): the `shell` request was never
+  answered and sessions stayed silent.
+
+### Fixed (Terminal) - 2026-06
+- OSC 10/11 color queries (`OSC 10;?` / `OSC 11;?`) are now answered with the
+  default palette. bubbletea/lipgloss TUI apps probe these at startup and wait
+  for replies before drawing.
+- OSC strings terminated with ST (`ESC \`) now dispatch; previously only
+  BEL/0x9C-terminated OSC dispatched, so ST-terminated queries were dropped.
+- `terminal_write` is now serialized with a mutex. Concurrent writers (SSH
+  connect task post-connect clear vs main-loop SSH RX drain) interleaved bytes
+  mid-escape-sequence, rendering query text on screen, clobbering CSI params,
+  and losing query replies.
+
+### Security
+- `.tsauth` (local Tailscale auth key) added to `.gitignore`.
+
 ### Added (SSH)
 - SSH auth method probing now runs before prompting for credentials.
 - Keyboard-interactive authentication fallback support was added.
 - SSH diagnostics now log supported client hostkey algorithms and explicit
   warning when `ssh-ed25519` host keys are unavailable in current build.
+- SSH now logs negotiated server hostkey fingerprint (SHA1) after handshake,
+  laying groundwork for future `known_hosts` trust pinning.
+- Initial TOFU host trust behavior now persists first-seen host fingerprint by
+  `host:port` and refuses future mismatches.
 
 ### Changed (Shell/UI)
 - `ssh` command now accepts both `ssh [user@]host[:port]` forms.
 - `about` command display line now reports live terminal geometry and cell size.
 - Terminal grid sizing now derives from active display resolution instead of
   fixed `100x32`.
+- SSH connect failure messages in shell now surface specific cause text when
+  available (for example hostkey/auth compatibility issues).
+
+### Changed (SSH)
+- Hostkey method preference list is now built from algorithms actually supported
+  by the current libssh2 build, preferring `ssh-ed25519`, ECDSA, then RSA.
+- Auth flow now attempts methods in order: `none` -> `publickey` (if runtime key
+  is loaded) -> password-style fallback.
+
+### Added (Shell)
+- New `sshkey` command for vault-backed SSH key management:
+  - `sshkey status`
+  - `sshkey import`
+  - `sshkey load`
+  - `sshkey clear`
+  - `sshkey erase`
 
 ### Documentation
 - Updated `README.md`, `SPEC.md`, and `AGENTS.md` for current ESP32-P4 status,

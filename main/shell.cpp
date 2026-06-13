@@ -21,8 +21,13 @@ static const char *TAG = "shell";
 
 #define CMD_MAX_ARGS 8
 #define CMD_TABLE_SIZE 16
-#define INPUT_BUF_SIZE 256
+#define INPUT_BUF_SIZE 2048
 #define HISTORY_SIZE 16
+#define SSH_PASS_BUF_SIZE 256
+#define SSH_KEY_MAX_LEN 4096
+
+static constexpr const char *SSH_VAULT_KEY_PRIVATE = "ssh_privkey";
+static constexpr const char *SSH_VAULT_KEY_PASSPHRASE = "ssh_keypass";
 
 typedef struct {
     const char *name;
@@ -61,6 +66,7 @@ extern void cmd_wifi(int argc, char **argv);
 extern void cmd_ssh(int argc, char **argv);
 extern void cmd_tailscale(int argc, char **argv);
 extern void cmd_hostname(int argc, char **argv);
+static void sshkey_reset_pending(void);
 
 static void completion_reset(void) {
     completion_active = false;
@@ -271,6 +277,7 @@ void shell_handle_key(char c) {
         else if (c == 0x1D) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'C'; n = 3; }
         else if (c == 0x1E) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'A'; n = 3; }
         else if (c == 0x1F) { buf[0] = 0x1B; buf[1] = '['; buf[2] = 'B'; n = 3; }
+        else if (c == '\n' || c == '\r') { buf[0] = '\r'; n = 1; }
         else { buf[0] = c; n = 1; }
         if ((uint8_t)c == 0x1B) {
             ESP_LOGI(TAG, "SSH key TX: ESC");
@@ -291,6 +298,7 @@ void shell_handle_key(char c) {
     } else if (c == 0x1B) {
         completion_reset();
         input_callback = NULL;
+        sshkey_reset_pending();
         input_masked = false;
         input_len = 0;
         input_cursor = 0;
@@ -520,7 +528,7 @@ typedef struct {
     char host[64];
     uint16_t port;
     char user[32];
-    char pass[INPUT_BUF_SIZE];
+    char pass[SSH_PASS_BUF_SIZE];
     bool allow_password_prompt;
 } ssh_connect_ctx_t;
 
@@ -529,6 +537,180 @@ static ssh_connect_ctx_t *ssh_connect_ctx_pending = NULL;
 
 static void ssh_password_cb(const char *pass);
 static bool ensure_ssh_connect_worker(void);
+static void cmd_sshkey_handler(int argc, char **argv);
+
+typedef enum {
+    SSHKEY_PENDING_NONE = 0,
+    SSHKEY_PENDING_IMPORT_VAULT_PASS,
+    SSHKEY_PENDING_IMPORT_PRIVATE_KEY,
+    SSHKEY_PENDING_IMPORT_KEY_PASSPHRASE,
+    SSHKEY_PENDING_LOAD_VAULT_PASS,
+} sshkey_pending_t;
+
+static sshkey_pending_t s_sshkey_pending = SSHKEY_PENDING_NONE;
+static char s_sshkey_vault_pass[SSH_PASS_BUF_SIZE] = {0};
+static char s_sshkey_private_key[SSH_KEY_MAX_LEN] = {0};
+static char s_sshkey_key_passphrase[SSH_PASS_BUF_SIZE] = {0};
+
+static inline void shell_secure_zero(void *p, size_t len) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (len--) *v++ = 0;
+}
+
+static void sshkey_reset_pending(void) {
+    s_sshkey_pending = SSHKEY_PENDING_NONE;
+    shell_secure_zero(s_sshkey_vault_pass, sizeof(s_sshkey_vault_pass));
+    shell_secure_zero(s_sshkey_private_key, sizeof(s_sshkey_private_key));
+    shell_secure_zero(s_sshkey_key_passphrase, sizeof(s_sshkey_key_passphrase));
+    s_sshkey_vault_pass[0] = '\0';
+    s_sshkey_private_key[0] = '\0';
+    s_sshkey_key_passphrase[0] = '\0';
+}
+
+static void decode_escaped_newlines(const char *src, char *dst, size_t dst_cap) {
+    if (!src || !dst || dst_cap == 0) return;
+    size_t o = 0;
+    for (size_t i = 0; src[i] != '\0' && o + 1 < dst_cap; i++) {
+        if (src[i] == '\\' && src[i + 1] == 'n') {
+            dst[o++] = '\n';
+            i++;
+            continue;
+        }
+        if (src[i] == '\r') continue;
+        dst[o++] = src[i];
+    }
+    dst[o] = '\0';
+}
+
+static void sshkey_input_cb(const char *input) {
+    if (!input) {
+        sshkey_reset_pending();
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_IMPORT_VAULT_PASS) {
+        snprintf(s_sshkey_vault_pass, sizeof(s_sshkey_vault_pass), "%s", input);
+        if (s_sshkey_vault_pass[0] == '\0') {
+            shell_print("\r\n  vault password required");
+            sshkey_reset_pending();
+            return;
+        }
+
+        if (!secret_vault_password_is_set()) {
+            esp_err_t err = secret_vault_password_set(s_sshkey_vault_pass);
+            if (err != ESP_OK) {
+                shell_print("\r\n  failed to set vault password");
+                sshkey_reset_pending();
+                return;
+            }
+        } else if (secret_vault_password_check(s_sshkey_vault_pass) != ESP_OK) {
+            shell_print("\r\n  invalid vault password");
+            sshkey_reset_pending();
+            return;
+        }
+
+        s_sshkey_pending = SSHKEY_PENDING_IMPORT_PRIVATE_KEY;
+        shell_print("\r\n  Private key PEM (use \\\\n for line breaks): ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_IMPORT_PRIVATE_KEY) {
+        decode_escaped_newlines(input, s_sshkey_private_key, sizeof(s_sshkey_private_key));
+        if (strstr(s_sshkey_private_key, "-----BEGIN") == NULL) {
+            shell_print("\r\n  invalid key format (expected PEM with BEGIN line)");
+            sshkey_reset_pending();
+            return;
+        }
+
+        s_sshkey_pending = SSHKEY_PENDING_IMPORT_KEY_PASSPHRASE;
+        shell_print("\r\n  Key passphrase (empty for none): ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_IMPORT_KEY_PASSPHRASE) {
+        snprintf(s_sshkey_key_passphrase, sizeof(s_sshkey_key_passphrase), "%s", input);
+
+        if (!ssh_set_private_key_pem(s_sshkey_private_key, s_sshkey_key_passphrase)) {
+            shell_print("\r\n  failed to load key in runtime");
+            sshkey_reset_pending();
+            return;
+        }
+
+        esp_err_t err = secret_vault_store(SSH_VAULT_KEY_PRIVATE,
+                                           s_sshkey_private_key,
+                                           s_sshkey_vault_pass);
+        if (err != ESP_OK) {
+            shell_print("\r\n  failed to store private key in vault");
+            sshkey_reset_pending();
+            return;
+        }
+
+        if (s_sshkey_key_passphrase[0]) {
+            err = secret_vault_store(SSH_VAULT_KEY_PASSPHRASE,
+                                     s_sshkey_key_passphrase,
+                                     s_sshkey_vault_pass);
+            if (err != ESP_OK) {
+                shell_print("\r\n  key stored, but failed to store key passphrase");
+                sshkey_reset_pending();
+                return;
+            }
+        } else {
+            secret_vault_remove(SSH_VAULT_KEY_PASSPHRASE);
+        }
+
+        shell_print("\r\n  SSH key imported and loaded");
+        sshkey_reset_pending();
+        return;
+    }
+
+    if (s_sshkey_pending == SSHKEY_PENDING_LOAD_VAULT_PASS) {
+        char key_buf[SSH_KEY_MAX_LEN] = {0};
+        char key_pass[SSH_PASS_BUF_SIZE] = {0};
+        snprintf(s_sshkey_vault_pass, sizeof(s_sshkey_vault_pass), "%s", input);
+        if (s_sshkey_vault_pass[0] == '\0') {
+            shell_print("\r\n  vault password required");
+            sshkey_reset_pending();
+            return;
+        }
+
+        esp_err_t err = secret_vault_load(SSH_VAULT_KEY_PRIVATE,
+                                          s_sshkey_vault_pass,
+                                          key_buf,
+                                          sizeof(key_buf));
+        if (err != ESP_OK) {
+            shell_print("\r\n  invalid vault password or missing ssh key");
+            shell_secure_zero(key_buf, sizeof(key_buf));
+            sshkey_reset_pending();
+            return;
+        }
+
+        err = secret_vault_load(SSH_VAULT_KEY_PASSPHRASE,
+                                s_sshkey_vault_pass,
+                                key_pass,
+                                sizeof(key_pass));
+        if (err != ESP_OK) {
+            key_pass[0] = '\0';
+        }
+
+        if (!ssh_set_private_key_pem(key_buf, key_pass)) {
+            shell_print("\r\n  failed to load key from vault");
+            shell_secure_zero(key_buf, sizeof(key_buf));
+            shell_secure_zero(key_pass, sizeof(key_pass));
+            sshkey_reset_pending();
+            return;
+        }
+
+        shell_print("\r\n  SSH key loaded from vault");
+        shell_secure_zero(key_buf, sizeof(key_buf));
+        shell_secure_zero(key_pass, sizeof(key_pass));
+        sshkey_reset_pending();
+        return;
+    }
+
+    sshkey_reset_pending();
+}
 
 static bool queue_ssh_connect(const char *pass, bool allow_password_prompt) {
     if (ssh_connect_pending) {
@@ -578,11 +760,18 @@ static void ssh_connect_worker_task(void *param) {
         bool ok = ssh_connect(ctx->host, ctx->port, ctx->user, ctx->pass);
         if (ok) {
             shell_set_ssh_active(true);
+            shell_print("\033[2J\033[H");
         } else if (ctx->allow_password_prompt && ssh_last_connect_requires_password()) {
             shell_print("\r\n  Password: ");
             shell_get_hidden_input(ssh_password_cb);
         } else {
-            shell_print("\r\n  SSH connection failed");
+            const char *why = ssh_last_connect_error();
+            if (why && why[0]) {
+                shell_print("\r\n  SSH connection failed: ");
+                shell_print(why);
+            } else {
+                shell_print("\r\n  SSH connection failed");
+            }
             if (!ssh_active) prompt(true);
         }
         ssh_connect_pending = false;
@@ -593,40 +782,95 @@ static void ssh_connect_worker_task(void *param) {
 static bool ensure_ssh_connect_worker(void) {
     if (ssh_connect_worker_handle) return true;
 
+    /*
+     * SSH connect path may persist trust records (NVS flash writes).
+     * Keep this task stack in internal RAM so cache-disabled flash sections
+     * do not trip esp_task_stack_is_sane_cache_disabled().
+     */
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
         ssh_connect_worker_task,
         "ssh_connect",
-        8192,
+        16384,
         NULL,
         5,
         &ssh_connect_worker_handle,
         1,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (ret != pdPASS) {
         ret = xTaskCreatePinnedToCoreWithCaps(
             ssh_connect_worker_task,
             "ssh_connect",
-            6144,
+            12288,
             NULL,
             5,
             &ssh_connect_worker_handle,
             1,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    }
-    if (ret != pdPASS) {
-        ret = xTaskCreatePinnedToCore(ssh_connect_worker_task, "ssh_connect", 8192, NULL, 5, &ssh_connect_worker_handle, 1);
-    }
-    if (ret != pdPASS) {
-        ret = xTaskCreatePinnedToCore(ssh_connect_worker_task, "ssh_connect", 6144, NULL, 5, &ssh_connect_worker_handle, 1);
-    }
-    if (ret != pdPASS) {
-        ret = xTaskCreate(ssh_connect_worker_task, "ssh_connect", 6144, NULL, 5, &ssh_connect_worker_handle);
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     return ret == pdPASS;
 }
 
 static void ssh_password_cb(const char *pass) {
     queue_ssh_connect(pass, false);
+}
+
+static void cmd_sshkey_handler(int argc, char **argv) {
+    if (argc < 2) {
+        shell_print("\r\n  usage: sshkey status|import|load|clear|erase");
+        return;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        shell_print(ssh_has_private_key()
+                        ? "\r\n  runtime key: loaded"
+                        : "\r\n  runtime key: not loaded");
+        shell_print(secret_vault_exists(SSH_VAULT_KEY_PRIVATE)
+                        ? "\r\n  vault key: present"
+                        : "\r\n  vault key: missing");
+        return;
+    }
+
+    if (strcmp(argv[1], "import") == 0) {
+        if (s_sshkey_pending != SSHKEY_PENDING_NONE) {
+            shell_print("\r\n  sshkey flow already in progress");
+            return;
+        }
+        s_sshkey_pending = SSHKEY_PENDING_IMPORT_VAULT_PASS;
+        shell_print("\r\n  Vault password: ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (strcmp(argv[1], "load") == 0) {
+        if (!secret_vault_exists(SSH_VAULT_KEY_PRIVATE)) {
+            shell_print("\r\n  no ssh key found in vault");
+            return;
+        }
+        if (s_sshkey_pending != SSHKEY_PENDING_NONE) {
+            shell_print("\r\n  sshkey flow already in progress");
+            return;
+        }
+        s_sshkey_pending = SSHKEY_PENDING_LOAD_VAULT_PASS;
+        shell_print("\r\n  Vault password: ");
+        shell_get_hidden_input(sshkey_input_cb);
+        return;
+    }
+
+    if (strcmp(argv[1], "clear") == 0) {
+        ssh_clear_private_key();
+        shell_print("\r\n  runtime ssh key cleared");
+        return;
+    }
+
+    if (strcmp(argv[1], "erase") == 0) {
+        ssh_clear_private_key();
+        secret_vault_remove(SSH_VAULT_KEY_PRIVATE);
+        secret_vault_remove(SSH_VAULT_KEY_PASSPHRASE);
+        shell_print("\r\n  ssh key erased from runtime and vault");
+        return;
+    }
+
+    shell_print("\r\n  usage: sshkey status|import|load|clear|erase");
 }
 
 static void cmd_ssh_handler(int argc, char **argv) {
@@ -708,6 +952,7 @@ void shell_init(terminal_t *t) {
     shell_register_cmd("clear", cmd_clear_handler);
     shell_register_cmd("wifi", cmd_wifi);
     shell_register_cmd("ssh", cmd_ssh_handler);
+    shell_register_cmd("sshkey", cmd_sshkey_handler);
     shell_register_cmd("tailscale", cmd_tailscale);
     shell_register_cmd("hostname", cmd_hostname);
     shell_register_cmd("vault", cmd_vault);

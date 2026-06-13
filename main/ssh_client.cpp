@@ -12,14 +12,20 @@
 #include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "nvs.h"
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdarg>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include "libssh2.h"
 #include "coex_manager.hpp"
+#include "mbedtls/pk.h"
+#include "mbedtls/rsa.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
 
 static const char *TAG = "SSH_CLIENT";
 
@@ -31,6 +37,8 @@ static const char *TAG = "SSH_CLIENT";
 #define SSH_HANDSHAKE_RETRIES 3
 #define SSH_VERBOSE_LOGS 0
 #define SSH_USE_RX_TASK 0
+#define SSH_PRIVATE_KEY_MAX_LEN 4096
+#define SSH_KEY_PASSPHRASE_MAX_LEN 128
 
 typedef struct {
     char data[SSH_RX_BUF_SIZE];
@@ -38,6 +46,7 @@ typedef struct {
 } ssh_rx_msg_t;
 
 static bool ssh_connected = false;
+static bool s_ssh_connecting = false;
 static int ssh_sock = -1;
 static LIBSSH2_SESSION *session = NULL;
 static LIBSSH2_CHANNEL *channel = NULL;
@@ -48,14 +57,88 @@ static TaskHandle_t ssh_recv_task_handle = NULL;
 static terminal_t *ssh_term = NULL;
 static SemaphoreHandle_t ssh_write_mutex = NULL;
 static int s_rx_trace_budget = 160;
+static int s_rx_preview_budget = 40;
 static uint8_t s_rx_prev_tail = 0;
 static int s_rx_loop_budget = 120;
 static int s_queue_drain_budget = 80;
+static uint32_t s_rx_raw_total = 0;
+static uint32_t s_rx_forwarded_total = 0;
+static uint32_t s_rx_filtered_total = 0;
+static uint32_t s_rx_queue_drop_total = 0;
+static uint32_t s_rx_raw_prev = 0;
+static uint32_t s_rx_forwarded_prev = 0;
+static uint32_t s_rx_filtered_prev = 0;
+static uint32_t s_rx_queue_drop_prev = 0;
+static TickType_t s_rx_diag_last_log = 0;
+static int s_rx_diag_budget = 120;
+static uint32_t s_tx_total = 0;
+static uint32_t s_tx_prev = 0;
 static bool s_last_connect_requires_password = false;
+static char s_last_connect_error[192] = "";
 static const char *s_kbdint_password = NULL;
+static char s_ssh_private_key_pem[SSH_PRIVATE_KEY_MAX_LEN] = "";
+static char s_ssh_private_key_passphrase[SSH_KEY_PASSPHRASE_MAX_LEN] = "";
+static constexpr char SSH_TRUST_NS[] = "sshtrust";
+static constexpr char SSH_IDENT_NS[] = "sshident";
+static constexpr char SSH_IDENT_KEY_DEFAULT[] = "default_priv";
+
+static inline void secure_zero_local(void *p, size_t len);
 
 bool ssh_last_connect_requires_password(void) {
     return s_last_connect_requires_password;
+}
+
+const char *ssh_last_connect_error(void) {
+    return s_last_connect_error;
+}
+
+bool ssh_set_private_key_pem(const char *private_key_pem, const char *passphrase) {
+    if (!private_key_pem) return false;
+    size_t n = strnlen(private_key_pem, SSH_PRIVATE_KEY_MAX_LEN);
+    if (n == 0 || n >= SSH_PRIVATE_KEY_MAX_LEN) {
+        return false;
+    }
+
+    memset(s_ssh_private_key_pem, 0, sizeof(s_ssh_private_key_pem));
+    memcpy(s_ssh_private_key_pem, private_key_pem, n);
+    s_ssh_private_key_pem[n] = '\0';
+
+    memset(s_ssh_private_key_passphrase, 0, sizeof(s_ssh_private_key_passphrase));
+    if (passphrase && passphrase[0]) {
+        size_t pn = strnlen(passphrase, SSH_KEY_PASSPHRASE_MAX_LEN);
+        if (pn >= SSH_KEY_PASSPHRASE_MAX_LEN) {
+            secure_zero_local(s_ssh_private_key_pem, sizeof(s_ssh_private_key_pem));
+            s_ssh_private_key_pem[0] = '\0';
+            return false;
+        }
+        memcpy(s_ssh_private_key_passphrase, passphrase, pn);
+        s_ssh_private_key_passphrase[pn] = '\0';
+    }
+
+    return true;
+}
+
+void ssh_clear_private_key(void) {
+    secure_zero_local(s_ssh_private_key_pem, sizeof(s_ssh_private_key_pem));
+    secure_zero_local(s_ssh_private_key_passphrase, sizeof(s_ssh_private_key_passphrase));
+    s_ssh_private_key_pem[0] = '\0';
+    s_ssh_private_key_passphrase[0] = '\0';
+}
+
+bool ssh_has_private_key(void) {
+    return s_ssh_private_key_pem[0] != '\0';
+}
+
+static void set_last_connect_error(const char *fmt, ...) {
+    if (!fmt || !fmt[0]) {
+        s_last_connect_error[0] = '\0';
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_last_connect_error, sizeof(s_last_connect_error), fmt, ap);
+    va_end(ap);
 }
 
 static size_t filter_and_reply_fast_queries(const char *src, size_t len, char *dst);
@@ -63,49 +146,227 @@ static void log_rx_trace(const char *data, size_t len);
 static void log_ssh_runtime_error_context(const char *where, int rc);
 static bool session_supports_alg(LIBSSH2_SESSION *sess, int method_type, const char *alg);
 static void log_supported_hostkey_algs(LIBSSH2_SESSION *sess);
+static bool build_hostkey_method_pref(LIBSSH2_SESSION *sess,
+                                      char *out,
+                                      size_t out_len,
+                                      bool *has_ed25519);
+static void log_server_hostkey_fingerprint(LIBSSH2_SESSION *sess);
+static bool get_server_hostkey_sha1(LIBSSH2_SESSION *sess,
+                                    char *fp,
+                                    size_t fp_len,
+                                    char *hostkey_type,
+                                    size_t hostkey_type_len);
+static bool verify_or_store_host_fingerprint(const char *host, uint16_t port, LIBSSH2_SESSION *sess);
+static uint32_t fnv1a_32(const char *s);
+static bool make_trust_key(const char *host, uint16_t port, char *out, size_t out_len);
+static bool load_trust_record(const char *trust_key,
+                              char *host_port_out,
+                              size_t host_port_out_len,
+                              char *fingerprint_out,
+                              size_t fingerprint_out_len);
+static bool save_trust_record(const char *trust_key, const char *host_port, const char *fingerprint);
+static bool ensure_default_identity_key_loaded(void);
+
+static bool load_default_identity_key(char *out, size_t out_len) {
+    if (!out || out_len < 2) return false;
+    out[0] = '\0';
+
+    nvs_handle_t nvs = 0;
+    if (nvs_open(SSH_IDENT_NS, NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+
+    size_t need = out_len;
+    esp_err_t err = nvs_get_str(nvs, SSH_IDENT_KEY_DEFAULT, out, &need);
+    nvs_close(nvs);
+    if (err != ESP_OK || need == 0 || out[0] == '\0') {
+        out[0] = '\0';
+        return false;
+    }
+
+    return true;
+}
+
+static bool save_default_identity_key(const char *pem) {
+    if (!pem || !pem[0]) return false;
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(SSH_IDENT_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return false;
+
+    err = nvs_set_str(nvs, SSH_IDENT_KEY_DEFAULT, pem);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+
+    return err == ESP_OK;
+}
+
+static bool generate_rsa_identity_pem(char *out, size_t out_len) {
+    if (!out || out_len < 64) return false;
+    out[0] = '\0';
+
+    mbedtls_pk_context pk;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    const char *pers = "dumbespty_ssh_identity";
+    int rc = -1;
+
+    mbedtls_pk_init(&pk);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+
+    rc = mbedtls_ctr_drbg_seed(&ctr_drbg,
+                               mbedtls_entropy_func,
+                               &entropy,
+                               (const unsigned char *)pers,
+                               strlen(pers));
+    if (rc != 0) goto clean_exit;
+
+    rc = mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+    if (rc != 0) goto clean_exit;
+
+    rc = mbedtls_rsa_gen_key(mbedtls_pk_rsa(pk),
+                             mbedtls_ctr_drbg_random,
+                             &ctr_drbg,
+                             2048,
+                             65537);
+    if (rc != 0) goto clean_exit;
+
+    rc = mbedtls_pk_write_key_pem(&pk, (unsigned char *)out, out_len);
+    if (rc != 0 || strstr(out, "-----BEGIN") == NULL) {
+        out[0] = '\0';
+        goto clean_exit;
+    }
+
+clean_exit:
+    mbedtls_pk_free(&pk);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_entropy_free(&entropy);
+    return rc == 0;
+}
+
+static bool ensure_default_identity_key_loaded(void) {
+    if (ssh_has_private_key()) {
+        return true;
+    }
+
+    char pem[SSH_PRIVATE_KEY_MAX_LEN];
+    memset(pem, 0, sizeof(pem));
+
+    if (load_default_identity_key(pem, sizeof(pem))) {
+        bool ok = ssh_set_private_key_pem(pem, "");
+        secure_zero_local(pem, sizeof(pem));
+        if (ok) {
+            ESP_LOGI(TAG, "Loaded default SSH identity key from NVS");
+            return true;
+        }
+        ESP_LOGW(TAG, "Stored default SSH identity key is invalid");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Generating default RSA identity key...");
+    if (!generate_rsa_identity_pem(pem, sizeof(pem))) {
+        secure_zero_local(pem, sizeof(pem));
+        ESP_LOGE(TAG, "Failed to generate default SSH identity key");
+        return false;
+    }
+
+    bool set_ok = ssh_set_private_key_pem(pem, "");
+    bool save_ok = set_ok && save_default_identity_key(pem);
+    secure_zero_local(pem, sizeof(pem));
+
+    if (!set_ok || !save_ok) {
+        ESP_LOGE(TAG, "Failed to persist default SSH identity key");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Generated and saved default SSH identity key");
+    return true;
+}
+
+static inline void secure_zero_local(void *p, size_t len) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (len--) *v++ = 0;
+}
 
 static void ssh_handle_rx_bytes(const char *src, size_t len) {
+    if (len > 0 && s_rx_preview_budget > 0) {
+        char preview[80];
+        size_t sample = len < 32 ? len : 32;
+        size_t p = 0;
+        for (size_t i = 0; i < sample && p < sizeof(preview) - 1; i++) {
+            uint8_t b = (uint8_t)src[i];
+            preview[p++] = (b >= 0x20 && b <= 0x7E) ? (char)b : '.';
+        }
+        preview[p] = '\0';
+        ESP_LOGI(TAG, "RX %uB preview: %s", (unsigned)len, preview);
+        s_rx_preview_budget--;
+    }
+
     size_t offset = 0;
     while (offset < len) {
         ssh_rx_msg_t msg;
         size_t chunk = len - offset;
         if (chunk > SSH_RX_BUF_SIZE - 1) chunk = SSH_RX_BUF_SIZE - 1;
         msg.len = filter_and_reply_fast_queries(src + offset, chunk, msg.data);
+        if (chunk >= msg.len) {
+            s_rx_filtered_total += (uint32_t)(chunk - msg.len);
+        }
         log_rx_trace(msg.data, msg.len);
         if (msg.len > 0) {
-            if (xQueueSend(ssh_rx_queue, &msg, pdMS_TO_TICKS(20)) != pdTRUE &&
-                s_rx_loop_budget > 0) {
-                ESP_LOGW(TAG, "SSH rx queue full, dropping %u bytes", (unsigned)msg.len);
-                s_rx_loop_budget--;
+            if (xQueueSend(ssh_rx_queue, &msg, pdMS_TO_TICKS(20)) == pdTRUE) {
+                s_rx_forwarded_total += (uint32_t)msg.len;
+            } else {
+                s_rx_queue_drop_total += (uint32_t)msg.len;
+                if (s_rx_loop_budget > 0) {
+                    ESP_LOGW(TAG, "SSH rx queue full, dropping %u bytes", (unsigned)msg.len);
+                    s_rx_loop_budget--;
+                }
             }
         }
         offset += chunk;
     }
 }
 
+static bool ssh_pump_channel_stream_once(int stream_id) {
+    if (!channel || !ssh_rx_queue) return false;
+
+    char buf[1024];
+    int rc = libssh2_channel_read_ex(channel, stream_id, buf, sizeof(buf) - 1);
+    if (rc > 0) {
+        s_rx_raw_total += (uint32_t)rc;
+        if (s_rx_loop_budget > 0) s_rx_loop_budget--;
+        buf[rc] = '\0';
+        ssh_handle_rx_bytes(buf, (size_t)rc);
+        return true;
+    }
+
+    if (rc == LIBSSH2_ERROR_EAGAIN || rc == 0) {
+        return false;
+    }
+
+    log_ssh_runtime_error_context(stream_id == 1 ? "SSH stderr read error" : "SSH rx read error", rc);
+    ESP_LOGW(TAG, "Marking SSH disconnected after read rc=%d stream=%d", rc, stream_id);
+    ssh_connected = false;
+    return false;
+}
+
 static void ssh_pump_rx_once(int max_reads) {
     if (!ssh_connected || !channel || !ssh_rx_queue) return;
 
-    char buf[1024];
     for (int i = 0; i < max_reads; i++) {
-        int rc = libssh2_channel_read(channel, buf, sizeof(buf) - 1);
-        if (rc > 0) {
-            if (s_rx_loop_budget > 0) s_rx_loop_budget--;
-            buf[rc] = '\0';
-            ssh_handle_rx_bytes(buf, (size_t)rc);
-            continue;
-        }
-
-        if (rc == LIBSSH2_ERROR_EAGAIN || rc == 0) {
+        bool got_stdout = ssh_pump_channel_stream_once(0);
+        bool got_stderr = ssh_pump_channel_stream_once(1);
+        if (!got_stdout && !got_stderr) {
             break;
         }
-
-        log_ssh_runtime_error_context("SSH rx read error", rc);
-        ssh_connected = false;
-        break;
     }
 
     if (libssh2_channel_eof(channel)) {
+        int exit_status = libssh2_channel_get_exit_status(channel);
+        ESP_LOGW(TAG, "Remote channel EOF (exit_status=%d)", exit_status);
         ssh_connected = false;
     }
 }
@@ -183,6 +444,254 @@ static void log_supported_hostkey_algs(LIBSSH2_SESSION *sess) {
     }
     ESP_LOGI(TAG, "%s", buf);
     libssh2_free(sess, (void *)algs);
+}
+
+static bool build_hostkey_method_pref(LIBSSH2_SESSION *sess,
+                                      char *out,
+                                      size_t out_len,
+                                      bool *has_ed25519) {
+    if (!sess || !out || out_len == 0) return false;
+    out[0] = '\0';
+    if (has_ed25519) *has_ed25519 = false;
+
+    static const char *kHostkeyPreferenceOrder[] = {
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "rsa-sha2-512",
+        "rsa-sha2-256",
+        "ssh-rsa",
+    };
+
+    size_t p = 0;
+    bool added_any = false;
+    for (size_t i = 0; i < sizeof(kHostkeyPreferenceOrder) / sizeof(kHostkeyPreferenceOrder[0]); i++) {
+        const char *alg = kHostkeyPreferenceOrder[i];
+        if (!session_supports_alg(sess, LIBSSH2_METHOD_HOSTKEY, alg)) {
+            continue;
+        }
+
+        int nw = snprintf(out + p, out_len - p, "%s%s", added_any ? "," : "", alg);
+        if (nw <= 0 || (size_t)nw >= (out_len - p)) {
+            break;
+        }
+        p += (size_t)nw;
+        added_any = true;
+        if (has_ed25519 && strcmp(alg, "ssh-ed25519") == 0) {
+            *has_ed25519 = true;
+        }
+    }
+    return added_any;
+}
+
+static bool get_server_hostkey_sha1(LIBSSH2_SESSION *sess,
+                                    char *fp,
+                                    size_t fp_len,
+                                    char *hostkey_type,
+                                    size_t hostkey_type_len) {
+    if (!sess || !fp || fp_len == 0) return false;
+
+    size_t hostkey_len = 0;
+    int hostkey_type_id = 0;
+    const char *hostkey = libssh2_session_hostkey(sess, &hostkey_len, &hostkey_type_id);
+    if (!hostkey || hostkey_len == 0) {
+        return false;
+    }
+
+    const char *hostkey_type_name = "unknown";
+    switch (hostkey_type_id) {
+        case LIBSSH2_HOSTKEY_TYPE_RSA:
+            hostkey_type_name = "ssh-rsa";
+            break;
+        case LIBSSH2_HOSTKEY_TYPE_DSS:
+            hostkey_type_name = "ssh-dss";
+            break;
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_256:
+            hostkey_type_name = "ecdsa-sha2-nistp256";
+            break;
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_384:
+            hostkey_type_name = "ecdsa-sha2-nistp384";
+            break;
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_521:
+            hostkey_type_name = "ecdsa-sha2-nistp521";
+            break;
+#ifdef LIBSSH2_HOSTKEY_TYPE_ED25519
+        case LIBSSH2_HOSTKEY_TYPE_ED25519:
+            hostkey_type_name = "ssh-ed25519";
+            break;
+#endif
+        default:
+            break;
+    }
+
+    if (hostkey_type && hostkey_type_len > 0) {
+        snprintf(hostkey_type, hostkey_type_len, "%s", hostkey_type_name);
+    }
+
+    const unsigned char *sha1 = (const unsigned char *)libssh2_hostkey_hash(sess,
+                                                                             LIBSSH2_HOSTKEY_HASH_SHA1);
+    if (!sha1) {
+        return false;
+    }
+
+    int p = 0;
+    for (int i = 0; i < 20 && p < (int)fp_len - 3; i++) {
+        p += snprintf(fp + p, fp_len - p, "%s%02x", (i == 0) ? "" : ":", sha1[i]);
+    }
+    fp[p] = '\0';
+    return true;
+}
+
+static void log_server_hostkey_fingerprint(LIBSSH2_SESSION *sess) {
+    if (!sess) return;
+    char fp[80] = {0};
+    char hostkey_type[32] = {0};
+    if (!get_server_hostkey_sha1(sess, fp, sizeof(fp), hostkey_type, sizeof(hostkey_type))) {
+        ESP_LOGW(TAG, "Unable to derive server host key fingerprint");
+        return;
+    }
+    ESP_LOGI(TAG, "Server host key: type=%s sha1=%s", hostkey_type, fp);
+}
+
+static uint32_t fnv1a_32(const char *s) {
+    uint32_t h = 2166136261u;
+    if (!s) return h;
+    while (*s) {
+        h ^= (uint8_t)(*s++);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static bool make_trust_key(const char *host, uint16_t port, char *out, size_t out_len) {
+    if (!host || !host[0] || !out || out_len == 0) return false;
+    char host_port[96];
+    int n = snprintf(host_port, sizeof(host_port), "%s:%u", host, (unsigned)port);
+    if (n <= 0 || n >= (int)sizeof(host_port)) return false;
+
+    uint32_t id = fnv1a_32(host_port);
+    n = snprintf(out, out_len, "h%08x", (unsigned)id);
+    return n > 0 && n < (int)out_len;
+}
+
+static bool load_trust_record(const char *trust_key,
+                              char *host_port_out,
+                              size_t host_port_out_len,
+                              char *fingerprint_out,
+                              size_t fingerprint_out_len) {
+    if (!trust_key || !host_port_out || !fingerprint_out) return false;
+    host_port_out[0] = '\0';
+    fingerprint_out[0] = '\0';
+
+    nvs_handle_t nvs = 0;
+    if (nvs_open(SSH_TRUST_NS, NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+
+    char record[180] = {0};
+    size_t record_len = sizeof(record);
+    esp_err_t err = nvs_get_str(nvs, trust_key, record, &record_len);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    const char *sep = strchr(record, '|');
+    if (!sep) {
+        return false;
+    }
+
+    size_t host_len = (size_t)(sep - record);
+    size_t fp_len = strnlen(sep + 1, sizeof(record) - host_len - 1);
+    if (host_len == 0 || fp_len == 0 || host_len >= host_port_out_len || fp_len >= fingerprint_out_len) {
+        return false;
+    }
+
+    memcpy(host_port_out, record, host_len);
+    host_port_out[host_len] = '\0';
+    memcpy(fingerprint_out, sep + 1, fp_len);
+    fingerprint_out[fp_len] = '\0';
+    return true;
+}
+
+static bool save_trust_record(const char *trust_key, const char *host_port, const char *fingerprint) {
+    if (!trust_key || !host_port || !fingerprint) return false;
+
+    char record[180] = {0};
+    int n = snprintf(record, sizeof(record), "%s|%s", host_port, fingerprint);
+    if (n <= 0 || n >= (int)sizeof(record)) {
+        return false;
+    }
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(SSH_TRUST_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return false;
+    }
+    err = nvs_set_str(nvs, trust_key, record);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
+static bool verify_or_store_host_fingerprint(const char *host, uint16_t port, LIBSSH2_SESSION *sess) {
+    if (!host || !host[0] || !sess) return true;
+
+    char fp[80] = {0};
+    char hostkey_type[32] = {0};
+    if (!get_server_hostkey_sha1(sess, fp, sizeof(fp), hostkey_type, sizeof(hostkey_type))) {
+        ESP_LOGW(TAG, "Host trust check skipped: fingerprint unavailable");
+        return true;
+    }
+
+    char trust_key[16] = {0};
+    char host_port[96] = {0};
+    if (!make_trust_key(host, port, trust_key, sizeof(trust_key))) {
+        ESP_LOGW(TAG, "Host trust key generation failed for %s:%u", host, (unsigned)port);
+        return true;
+    }
+    snprintf(host_port, sizeof(host_port), "%s:%u", host, (unsigned)port);
+
+    char stored_host_port[96] = {0};
+    char stored_fp[80] = {0};
+    if (!load_trust_record(trust_key,
+                           stored_host_port,
+                           sizeof(stored_host_port),
+                           stored_fp,
+                           sizeof(stored_fp))) {
+        if (!save_trust_record(trust_key, host_port, fp)) {
+            ESP_LOGW(TAG, "Failed to persist TOFU host fingerprint for %s", host_port);
+            return true;
+        }
+        ESP_LOGI(TAG, "Host trust TOFU: %s type=%s sha1=%s", host_port, hostkey_type, fp);
+        return true;
+    }
+
+    if (strcmp(stored_host_port, host_port) != 0) {
+        ESP_LOGW(TAG,
+                 "Host trust key collision (%s): stored=%s current=%s",
+                 trust_key,
+                 stored_host_port,
+                 host_port);
+        set_last_connect_error("host trust key collision for %s", host_port);
+        return false;
+    }
+
+    if (strcmp(stored_fp, fp) != 0) {
+        ESP_LOGE(TAG,
+                 "Host key mismatch for %s: expected=%s got=%s",
+                 host_port,
+                 stored_fp,
+                 fp);
+        set_last_connect_error("host key mismatch for %s", host_port);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Host trust verified: %s sha1=%s", host_port, fp);
+    return true;
 }
 
 static QueueHandle_t create_rx_queue_with_fallback(void) {
@@ -343,6 +852,30 @@ static void delete_rx_queue(void) {
 
 static int waitsocket(int sock, LIBSSH2_SESSION *sess);
 
+static void log_channel_timeout_context(const char *op, LIBSSH2_CHANNEL *ch) {
+    int dir = session ? libssh2_session_block_directions(session) : 0;
+    int eof = ch ? libssh2_channel_eof(ch) : -1;
+    int exit_status = ch ? libssh2_channel_get_exit_status(ch) : -1;
+
+    ESP_LOGW(TAG,
+             "%s timeout context: block_dir=%d eof=%d exit_status=%d",
+             op ? op : "channel",
+             dir,
+             eof,
+             exit_status);
+
+    if (session) {
+        char *errmsg = NULL;
+        int errmsg_len = 0;
+        int errcode = libssh2_session_last_error(session, &errmsg, &errmsg_len, 0);
+        if (errmsg && errmsg_len > 0) {
+            ESP_LOGW(TAG, "%s timeout: libssh2 err=%d msg=%.*s", op ? op : "channel", errcode, errmsg_len, errmsg);
+        } else {
+            ESP_LOGW(TAG, "%s timeout: libssh2 err=%d", op ? op : "channel", errcode);
+        }
+    }
+}
+
 static const char *safe_method_name(int method_type) {
     if (!session) return "n/a";
     const char *m = libssh2_session_methods(session, method_type);
@@ -413,6 +946,37 @@ static int ssh_userauth_with_timeout(const char *user, const char *pass, int tim
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     while (xTaskGetTickCount() < deadline) {
         int rc = libssh2_userauth_password(session, user, pass);
+        if (rc == 0) return 0;
+        if (rc == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        return rc;
+    }
+    return LIBSSH2_ERROR_TIMEOUT;
+}
+
+static int ssh_userauth_publickey_with_timeout(const char *user,
+                                               const char *private_key_pem,
+                                               const char *passphrase,
+                                               int timeout_ms) {
+    if (!user || !user[0] || !private_key_pem || !private_key_pem[0]) {
+        return LIBSSH2_ERROR_AUTHENTICATION_FAILED;
+    }
+
+    size_t user_len = strlen(user);
+    size_t key_len = strlen(private_key_pem);
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int rc = libssh2_userauth_publickey_frommemory(session,
+                                                       user,
+                                                       user_len,
+                                                       NULL,
+                                                       0,
+                                                       private_key_pem,
+                                                       key_len,
+                                                       (passphrase && passphrase[0]) ? passphrase : NULL);
         if (rc == 0) return 0;
         if (rc == LIBSSH2_ERROR_EAGAIN) {
             waitsocket(ssh_sock, session);
@@ -521,10 +1085,29 @@ static LIBSSH2_CHANNEL *ssh_channel_open_with_timeout(int timeout_ms) {
     return NULL;
 }
 
+/* Request PTY with terminal dimensions included in the pty-req itself.
+ *
+ * Important compatibility note: do NOT send a separate window-change
+ * ("pty size") request between pty-req and shell. Go-based SSH servers
+ * (e.g. terminal.shop, charm/wish stacks) can stop servicing channel
+ * requests in that ordering, so the shell request never gets a reply
+ * and the session stays silent. Passing dimensions inside pty-req
+ * avoids the extra request entirely.
+ */
 static int ssh_channel_request_pty_with_timeout(LIBSSH2_CHANNEL *ch, const char *termtype, int timeout_ms) {
+    int cols = ssh_term ? ssh_term->cols : 80;
+    int rows = ssh_term ? ssh_term->rows : 24;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     while (xTaskGetTickCount() < deadline) {
-        int rc = libssh2_channel_request_pty(ch, termtype);
+        int rc = libssh2_channel_request_pty_ex(ch,
+                                                termtype,
+                                                (unsigned int)strlen(termtype),
+                                                NULL,
+                                                0,
+                                                cols,
+                                                rows,
+                                                0,
+                                                0);
         if (rc == 0) return 0;
         if (rc == LIBSSH2_ERROR_EAGAIN) {
             waitsocket(ssh_sock, session);
@@ -533,6 +1116,7 @@ static int ssh_channel_request_pty_with_timeout(LIBSSH2_CHANNEL *ch, const char 
         }
         return rc;
     }
+    log_channel_timeout_context("channel_request_pty", ch);
     return LIBSSH2_ERROR_TIMEOUT;
 }
 
@@ -548,7 +1132,403 @@ static int ssh_channel_shell_with_timeout(LIBSSH2_CHANNEL *ch, int timeout_ms) {
         }
         return rc;
     }
+    int avail_out = ch ? libssh2_poll_channel_read(ch, 0) : 0;
+    int avail_err = ch ? libssh2_poll_channel_read(ch, 1) : 0;
+    if (avail_out > 0 || avail_err > 0) {
+        ESP_LOGW(TAG,
+                 "channel_shell timed out waiting for reply but data is available (stdout=%d stderr=%d); treating as success",
+                 avail_out,
+                 avail_err);
+        return 0;
+    }
+
+    log_channel_timeout_context("channel_shell", ch);
     return LIBSSH2_ERROR_TIMEOUT;
+}
+
+static int ssh_channel_shell_no_reply_with_timeout(LIBSSH2_CHANNEL *ch, int timeout_ms) {
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int rc = libssh2_channel_process_startup_no_reply(ch, "shell", 5, NULL, 0);
+        if (rc == 0) return 0;
+        if (rc == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        return rc;
+    }
+    log_channel_timeout_context("channel_shell_no_reply", ch);
+    return LIBSSH2_ERROR_TIMEOUT;
+}
+
+static int ssh_channel_exec_no_reply_with_timeout(LIBSSH2_CHANNEL *ch,
+                                                  const char *cmd,
+                                                  int timeout_ms) {
+    if (!cmd) return LIBSSH2_ERROR_INVAL;
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int rc = libssh2_channel_process_startup_no_reply(ch,
+                                                          "exec",
+                                                          4,
+                                                          cmd,
+                                                          (unsigned int)strlen(cmd));
+        if (rc == 0) return 0;
+        if (rc == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        return rc;
+    }
+    log_channel_timeout_context(cmd, ch);
+    return LIBSSH2_ERROR_TIMEOUT;
+}
+
+static int ssh_channel_exec_with_timeout(LIBSSH2_CHANNEL *ch,
+                                         const char *cmd,
+                                         int timeout_ms) {
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int rc = libssh2_channel_exec(ch, cmd);
+        if (rc == 0) return 0;
+        if (rc == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        return rc;
+    }
+    log_channel_timeout_context(cmd ? cmd : "channel_exec", ch);
+    return LIBSSH2_ERROR_TIMEOUT;
+}
+
+static bool ssh_channel_stays_open_briefly(LIBSSH2_CHANNEL *ch, int observe_ms) {
+    if (!ch) return false;
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(observe_ms);
+    char scratch[64];
+    while (xTaskGetTickCount() < deadline) {
+        if (libssh2_channel_eof(ch)) {
+            return false;
+        }
+
+        int rc = libssh2_channel_read(ch, scratch, sizeof(scratch));
+        if (rc > 0) {
+            return true;
+        }
+        if (rc == LIBSSH2_ERROR_EAGAIN || rc == 0) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        return false;
+    }
+
+    return !libssh2_channel_eof(ch);
+}
+
+static bool ssh_open_pty_shell_fallback(const char *termtype,
+                                        int pty_timeout_ms,
+                                        int shell_timeout_ms,
+                                        int observe_ms) {
+    channel = ssh_channel_open_with_timeout(15000);
+    if (!channel) {
+        ESP_LOGW(TAG, "Channel reopen failed for PTY retry (term=%s)", termtype);
+        return false;
+    }
+
+    libssh2_channel_set_blocking(channel, 0);
+    int pty_rc = ssh_channel_request_pty_with_timeout(channel, termtype, pty_timeout_ms);
+    if (pty_rc != 0) {
+        ESP_LOGW(TAG, "PTY retry failed (term=%s): %d", termtype, pty_rc);
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+        channel = NULL;
+        return false;
+    }
+
+    /* Terminal dimensions are sent inside pty-req; no separate
+     * window-change request (Go SSH server compatibility). */
+
+    int sh_rc = ssh_channel_shell_with_timeout(channel, shell_timeout_ms);
+    if (sh_rc == 0 && ssh_channel_stays_open_briefly(channel, observe_ms)) {
+        ESP_LOGI(TAG, "Shell retry succeeded with PTY term=%s", termtype);
+        return true;
+    }
+
+    if (sh_rc == 0) {
+        ESP_LOGW(TAG, "Shell retry opened then closed with PTY term=%s", termtype);
+    } else {
+        ESP_LOGW(TAG, "Shell retry failed with PTY term=%s rc=%d", termtype, sh_rc);
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+    channel = NULL;
+    return false;
+}
+
+static bool ssh_channel_wait_for_output(LIBSSH2_CHANNEL *ch,
+                                        int observe_ms,
+                                        bool send_probe) {
+    if (!ch) return false;
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(observe_ms);
+    bool probe_sent = false;
+    char scratch[160];
+    while (xTaskGetTickCount() < deadline) {
+        int rd_out = libssh2_channel_read_ex(ch, 0, scratch, sizeof(scratch));
+        if (rd_out > 0) return true;
+        if (rd_out < 0 && rd_out != LIBSSH2_ERROR_EAGAIN) return false;
+
+        int rd_err = libssh2_channel_read_ex(ch, 1, scratch, sizeof(scratch));
+        if (rd_err > 0) return true;
+        if (rd_err < 0 && rd_err != LIBSSH2_ERROR_EAGAIN) return false;
+
+        int avail_out = libssh2_poll_channel_read(ch, 0);
+        int avail_err = libssh2_poll_channel_read(ch, 1);
+        if (avail_out > 0 || avail_err > 0) {
+            return true;
+        }
+
+        if (libssh2_channel_eof(ch)) {
+            return false;
+        }
+
+        if (send_probe && !probe_sent) {
+            int wr = libssh2_channel_write(ch, "\r\n", 2);
+            if (wr == 2) {
+                probe_sent = true;
+            } else if (wr < 0 && wr != LIBSSH2_ERROR_EAGAIN) {
+                return false;
+            }
+        }
+
+        waitsocket(ssh_sock, session);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    return false;
+}
+
+static bool ssh_channel_bootstrap_expect_output(LIBSSH2_CHANNEL *ch,
+                                                int per_probe_wait_ms,
+                                                int tail_wait_ms) {
+    if (!ch) return false;
+
+    static const char *probe_seq[] = {
+        "\r",
+        "\n",
+        "\r\n",
+        "echo __DUMBESPTY_SHELL_READY__\r",
+        "printf __DUMBESPTY_SHELL_READY__\\n\r"
+    };
+
+    for (size_t i = 0; i < sizeof(probe_seq) / sizeof(probe_seq[0]); i++) {
+        const char *probe = probe_seq[i];
+        int probe_len = (int)strlen(probe);
+        int wr = libssh2_channel_write(ch, probe, probe_len);
+        if (wr < 0 && wr != LIBSSH2_ERROR_EAGAIN) {
+            return false;
+        }
+
+        if (ssh_channel_wait_for_output(ch, per_probe_wait_ms, false)) {
+            return true;
+        }
+
+        if (libssh2_channel_eof(ch)) {
+            return false;
+        }
+    }
+
+    return ssh_channel_wait_for_output(ch, tail_wait_ms, false);
+}
+
+static bool ssh_open_pty_shell_no_reply_fallback(const char *termtype,
+                                                  int pty_timeout_ms,
+                                                  int startup_timeout_ms,
+                                                  int observe_ms) {
+    channel = ssh_channel_open_with_timeout(15000);
+    if (!channel) {
+        ESP_LOGW(TAG, "Channel reopen failed for PTY no-reply shell (term=%s)", termtype);
+        return false;
+    }
+
+    libssh2_channel_set_blocking(channel, 0);
+    int pty_rc = ssh_channel_request_pty_with_timeout(channel, termtype, pty_timeout_ms);
+    if (pty_rc != 0) {
+        ESP_LOGW(TAG, "PTY no-reply shell failed PTY request (term=%s): %d", termtype, pty_rc);
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+        channel = NULL;
+        return false;
+    }
+
+    /* Terminal dimensions are sent inside pty-req; no separate
+     * window-change request (Go SSH server compatibility). */
+
+    int sh_rc = ssh_channel_shell_no_reply_with_timeout(channel, startup_timeout_ms);
+    if (sh_rc == 0 && ssh_channel_stays_open_briefly(channel, observe_ms)) {
+        bool had_output = ssh_channel_wait_for_output(channel, observe_ms, true);
+        if (had_output) {
+            ESP_LOGI(TAG, "Shell no-reply fallback succeeded with PTY term=%s (output seen)", termtype);
+            return true;
+        } else {
+            ESP_LOGW(TAG, "Shell no-reply fallback stayed silent with PTY term=%s", termtype);
+        }
+    }
+
+    if (sh_rc == 0) {
+        ESP_LOGW(TAG, "Shell no-reply fallback opened then closed (term=%s)", termtype);
+    } else {
+        ESP_LOGW(TAG, "Shell no-reply fallback failed (term=%s rc=%d)", termtype, sh_rc);
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+    channel = NULL;
+    return false;
+}
+
+static bool ssh_open_pty_exec_no_reply_fallback(const char *termtype,
+                                                const char *cmd,
+                                                int pty_timeout_ms,
+                                                int startup_timeout_ms,
+                                                int observe_ms) {
+    channel = ssh_channel_open_with_timeout(15000);
+    if (!channel) {
+        ESP_LOGW(TAG, "Channel reopen failed for PTY no-reply exec (term=%s)", termtype);
+        return false;
+    }
+
+    libssh2_channel_set_blocking(channel, 0);
+    int pty_rc = ssh_channel_request_pty_with_timeout(channel, termtype, pty_timeout_ms);
+    if (pty_rc != 0) {
+        ESP_LOGW(TAG, "PTY no-reply exec failed PTY request (term=%s): %d", termtype, pty_rc);
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+        channel = NULL;
+        return false;
+    }
+
+    /* Terminal dimensions are sent inside pty-req; no separate
+     * window-change request (Go SSH server compatibility). */
+
+    int ex_rc = ssh_channel_exec_no_reply_with_timeout(channel, cmd, startup_timeout_ms);
+    if (ex_rc == 0 && ssh_channel_stays_open_briefly(channel, observe_ms)) {
+        bool had_output = ssh_channel_wait_for_output(channel, observe_ms, true);
+        if (had_output) {
+            ESP_LOGI(TAG, "PTY no-reply exec fallback succeeded: term=%s cmd=%s", termtype, cmd);
+            return true;
+        }
+        ESP_LOGW(TAG, "PTY no-reply exec fallback stayed silent: term=%s cmd=%s", termtype, cmd);
+    } else if (ex_rc == 0) {
+        ESP_LOGW(TAG, "PTY no-reply exec fallback opened then closed: term=%s cmd=%s", termtype, cmd);
+    } else {
+        ESP_LOGW(TAG, "PTY no-reply exec fallback failed: term=%s cmd=%s rc=%d", termtype, cmd, ex_rc);
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+    channel = NULL;
+    return false;
+}
+
+static bool ssh_open_pty_exec_fallback(const char *termtype,
+                                       const char *cmd,
+                                       int pty_timeout_ms,
+                                       int exec_timeout_ms,
+                                       int observe_ms) {
+    channel = ssh_channel_open_with_timeout(15000);
+    if (!channel) {
+        ESP_LOGW(TAG, "Channel reopen failed for PTY exec fallback (term=%s)", termtype);
+        return false;
+    }
+
+    libssh2_channel_set_blocking(channel, 0);
+    int pty_rc = ssh_channel_request_pty_with_timeout(channel, termtype, pty_timeout_ms);
+    if (pty_rc != 0) {
+        ESP_LOGW(TAG, "PTY exec fallback failed PTY request (term=%s): %d", termtype, pty_rc);
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+        channel = NULL;
+        return false;
+    }
+
+    /* Terminal dimensions are sent inside pty-req; no separate
+     * window-change request (Go SSH server compatibility). */
+
+    int ex_rc = ssh_channel_exec_with_timeout(channel, cmd, exec_timeout_ms);
+    if (ex_rc == 0 && ssh_channel_stays_open_briefly(channel, observe_ms)) {
+        ESP_LOGI(TAG, "PTY exec fallback succeeded: term=%s cmd=%s", termtype, cmd);
+        return true;
+    }
+
+    if (ex_rc == 0) {
+        ESP_LOGW(TAG, "PTY exec fallback opened then closed: term=%s cmd=%s", termtype, cmd);
+    } else {
+        ESP_LOGW(TAG, "PTY exec fallback failed: term=%s cmd=%s rc=%d", termtype, cmd, ex_rc);
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+    channel = NULL;
+    return false;
+}
+
+static bool ssh_open_raw_channel_fallback(int probe_ms) {
+    channel = ssh_channel_open_with_timeout(15000);
+    if (!channel) {
+        ESP_LOGW(TAG, "Channel reopen failed for raw fallback");
+        return false;
+    }
+
+    libssh2_channel_set_blocking(channel, 0);
+
+    if (ssh_channel_wait_for_output(channel, probe_ms, true)) {
+        ESP_LOGI(TAG, "Raw channel fallback has data");
+        return true;
+    }
+
+    if (!libssh2_channel_eof(channel)) {
+        ESP_LOGW(TAG, "Raw channel fallback produced no output during probe");
+    } else {
+        ESP_LOGW(TAG, "Raw channel fallback hit EOF during probe");
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+    channel = NULL;
+    return false;
+}
+
+static bool ssh_open_shell_no_pty_fallback(int shell_timeout_ms, int observe_ms) {
+    channel = ssh_channel_open_with_timeout(15000);
+    if (!channel) {
+        ESP_LOGW(TAG, "Channel reopen failed for no-PTY shell fallback");
+        return false;
+    }
+
+    libssh2_channel_set_blocking(channel, 0);
+    int sh_rc = ssh_channel_shell_with_timeout(channel, shell_timeout_ms);
+    if (sh_rc == 0 && ssh_channel_stays_open_briefly(channel, observe_ms)) {
+        ESP_LOGI(TAG, "Shell fallback succeeded without PTY");
+        return true;
+    }
+
+    if (sh_rc == 0) {
+        ESP_LOGW(TAG, "No-PTY shell opened then closed");
+    } else {
+        ESP_LOGW(TAG, "No-PTY shell fallback failed rc=%d", sh_rc);
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+    channel = NULL;
+    return false;
 }
 
 static bool ssh_probe_banner_with_timeout(char *dst, size_t dst_len, int timeout_ms) {
@@ -687,22 +1667,17 @@ static int waitsocket(int sock, LIBSSH2_SESSION *sess) {
 
 #if SSH_USE_RX_TASK
 static void ssh_recv_task(void *param) {
-    char buf[1024];
     ESP_LOGD(TAG, "SSH recv task started");
 
     while (ssh_connected && channel) {
-        int rc = libssh2_channel_read(channel, buf, sizeof(buf) - 1);
+        bool got_stdout = ssh_pump_channel_stream_once(0);
+        bool got_stderr = ssh_pump_channel_stream_once(1);
 
-        if (rc > 0) {
-            if (s_rx_loop_budget > 0) s_rx_loop_budget--;
-            buf[rc] = '\0';
-            ssh_handle_rx_bytes(buf, (size_t)rc);
-        } else if (rc == LIBSSH2_ERROR_EAGAIN || rc == 0) {
+        if (got_stdout || got_stderr) {
+            /* keep pumping */
+        } else {
             waitsocket(ssh_sock, session);
             vTaskDelay(pdMS_TO_TICKS(10));
-        } else {
-            log_ssh_runtime_error_context("SSH rx read error", rc);
-            break;
         }
 
         if (libssh2_channel_eof(channel)) break;
@@ -716,10 +1691,23 @@ static void ssh_recv_task(void *param) {
 #endif
 
 bool ssh_connect(const char *host, uint16_t port, const char *user, const char *pass) {
+    struct connect_flag_guard_t {
+        bool *flag;
+        explicit connect_flag_guard_t(bool *f) : flag(f) {}
+        ~connect_flag_guard_t() {
+            if (flag) *flag = false;
+        }
+    };
+
+    s_ssh_connecting = true;
+    connect_flag_guard_t connect_guard(&s_ssh_connecting);
+
     s_last_connect_requires_password = false;
+    set_last_connect_error("");
 
     if (ssh_connected) {
         ESP_LOGW(TAG, "Already connected");
+        set_last_connect_error("already connected");
         return false;
     }
 
@@ -736,6 +1724,7 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
     if (!wifi_mgr_is_connected()) {
         ESP_LOGE(TAG, "WiFi not connected");
+        set_last_connect_error("wifi not connected");
         coex_release();
         return false;
     }
@@ -744,6 +1733,7 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     struct hostent *he = gethostbyname(host);
     if (!he) {
         ESP_LOGE(TAG, "DNS lookup failed for %s", host);
+        set_last_connect_error("dns lookup failed for '%s'", host);
         close(ssh_sock); ssh_sock = -1;
         delete_rx_queue();
         coex_release();
@@ -767,6 +1757,7 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
     if (!tcp_connect_with_retry(&saddr, bind_ip)) {
         ESP_LOGE(TAG, "TCP connect failed: errno=%d %s", errno, strerror(errno));
+        set_last_connect_error("tcp connect failed: %s", strerror(errno));
         int so_error = 0;
         socklen_t optlen = sizeof(so_error);
         if (ssh_sock >= 0) getsockopt(ssh_sock, SOL_SOCKET, SO_ERROR, &so_error, &optlen);
@@ -834,6 +1825,12 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 #endif
 
         const bool use_conservative_profile = (hs_try == 1);
+        bool hostkey_has_ed25519 = false;
+        char hostkey_pref[160];
+        bool have_hostkey_pref = build_hostkey_method_pref(session,
+                                                           hostkey_pref,
+                                                           sizeof(hostkey_pref),
+                                                           &hostkey_has_ed25519);
         if (use_conservative_profile) {
             /* First try a conservative profile that has been stable on ESP.
              * If handshake still fails, retries fall back to libssh2 defaults. */
@@ -847,11 +1844,23 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
                                         "hmac-sha1,hmac-sha2-256,hmac-sha2-512");
             libssh2_session_method_pref(session, LIBSSH2_METHOD_KEX,
                                         "ecdh-sha2-nistp256,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1");
-            libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY,
-                                        "ecdsa-sha2-nistp256,ssh-ed25519");
+            if (have_hostkey_pref) {
+                libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, hostkey_pref);
+            }
             ESP_LOGI(TAG, "Using conservative SSH method profile (attempt %d)", hs_try);
+            if (have_hostkey_pref) {
+                ESP_LOGI(TAG, "Hostkey preference list: %s", hostkey_pref);
+            }
+            if (!hostkey_has_ed25519) {
+                ESP_LOGW(TAG,
+                         "ssh-ed25519 hostkey algorithm is not available in this client build");
+            }
         } else {
             ESP_LOGI(TAG, "Using libssh2 default SSH method profile (attempt %d)", hs_try);
+            if (!hostkey_has_ed25519) {
+                ESP_LOGW(TAG,
+                         "ssh-ed25519 hostkey algorithm is not available in this client build");
+            }
         }
 
 #if SSH_VERBOSE_LOGS
@@ -867,15 +1876,25 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         ESP_LOGI(TAG, "Starting SSH handshake (attempt %d/%d)...", hs_try, SSH_HANDSHAKE_RETRIES);
         rc = ssh_handshake_with_timeout(SSH_HANDSHAKE_TIMEOUT_MS);
         if (rc == 0) {
-            break;
+            log_server_hostkey_fingerprint(session);
+            if (!verify_or_store_host_fingerprint(host, port, session)) {
+                rc = -1000;
+            } else {
+                break;
+            }
         }
 
         log_session_error("Handshake");
         ESP_LOGE(TAG, "Handshake failed: rc=%d errno=%d %s", rc, errno, strerror(errno));
-        if (rc == LIBSSH2_ERROR_KEX_FAILURE &&
+        if (rc == -1000) {
+            ESP_LOGE(TAG, "Handshake accepted but host trust verification failed");
+        } else if (rc == LIBSSH2_ERROR_KEX_FAILURE &&
             !session_supports_alg(session, LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519")) {
             ESP_LOGW(TAG,
                      "This SSH client build does not support ssh-ed25519 host keys; servers offering only ssh-ed25519 cannot be used");
+            set_last_connect_error("handshake failed: ssh-ed25519 hostkeys unsupported by this build");
+        } else if (s_last_connect_error[0] == '\0') {
+            set_last_connect_error("handshake failed (rc=%d)", rc);
         }
 
         libssh2_session_free(session);
@@ -894,6 +1913,7 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         vTaskDelay(pdMS_TO_TICKS(250));
         if (!tcp_connect_with_retry(&saddr, bind_ip)) {
             ESP_LOGE(TAG, "TCP reconnect failed after handshake error");
+            set_last_connect_error("tcp reconnect failed after handshake");
             delete_rx_queue();
             coex_release();
             return false;
@@ -917,16 +1937,40 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
                                                                sizeof(auth_methods),
                                                                &none_auth_succeeded,
                                                                SSH_HANDSHAKE_TIMEOUT_MS);
+    bool publickey_supported = have_auth_methods && strstr(auth_methods, "publickey");
     bool password_supported = have_auth_methods && strstr(auth_methods, "password");
     bool kbdint_supported = have_auth_methods && strstr(auth_methods, "keyboard-interactive");
+    bool key_loaded = ssh_has_private_key();
+
+    if (!key_loaded && publickey_supported) {
+        key_loaded = ensure_default_identity_key_loaded();
+        if (!key_loaded) {
+            ESP_LOGW(TAG, "Publickey is supported but default identity key is unavailable");
+        }
+    }
 
     if (none_auth_succeeded) {
         ESP_LOGI(TAG, "Auth OK via 'none' method");
         rc = 0;
+    } else if (have_auth_methods && publickey_supported && key_loaded) {
+        rc = ssh_userauth_publickey_with_timeout(user,
+                                                 s_ssh_private_key_pem,
+                                                 s_ssh_private_key_passphrase,
+                                                 SSH_HANDSHAKE_TIMEOUT_MS);
+        if (rc == 0) {
+            ESP_LOGI(TAG, "Auth OK via 'publickey' method");
+        } else {
+            ESP_LOGW(TAG, "Publickey auth failed rc=%d (methods: %s)", rc, auth_methods);
+            if (!(pass && pass[0]) && (password_supported || kbdint_supported)) {
+                s_last_connect_requires_password = true;
+                set_last_connect_error("server requires password authentication");
+                ESP_LOGI(TAG, "Prompting for password after publickey failure");
+            }
+        }
     } else if (!have_auth_methods) {
         ESP_LOGW(TAG, "Could not query auth methods; continuing with configured auth path");
         rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
-    } else if (pass && pass[0]) {
+    } else if (pass && pass[0] && (password_supported || kbdint_supported)) {
         if (kbdint_supported) {
             rc = ssh_userauth_kbdint_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
             if (rc != 0 && password_supported) {
@@ -936,18 +1980,45 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
             rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
         }
     } else {
-        if (password_supported || kbdint_supported) {
+        if (publickey_supported && !key_loaded && !(pass && pass[0])) {
+            set_last_connect_error("server requires publickey auth; load key with sshkey load/import");
+            ESP_LOGW(TAG, "Publickey auth required but no key is loaded (methods: %s)", auth_methods);
+        } else if (password_supported || kbdint_supported) {
             s_last_connect_requires_password = true;
+            set_last_connect_error("server requires password authentication");
             ESP_LOGI(TAG, "Password-style auth required by server (methods: %s)", auth_methods);
+        } else if (publickey_supported) {
+            set_last_connect_error("server requires publickey auth; key authentication failed");
+            ESP_LOGW(TAG, "Publickey auth available but failed (methods: %s)", auth_methods);
         } else {
+            set_last_connect_error("no supported auth methods offered by server (%s)", auth_methods);
             ESP_LOGW(TAG, "No passwordless auth available (methods: %s)", auth_methods);
         }
         rc = LIBSSH2_ERROR_AUTHENTICATION_FAILED;
     }
 
+    if (rc != 0 &&
+        have_auth_methods &&
+        (pass && pass[0]) &&
+        (password_supported || kbdint_supported) &&
+        !(none_auth_succeeded)) {
+        ESP_LOGI(TAG, "Falling back to password-style auth after prior auth failure");
+        if (kbdint_supported) {
+            rc = ssh_userauth_kbdint_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+            if (rc != 0 && password_supported) {
+                rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+            }
+        } else {
+            rc = ssh_userauth_with_timeout(user, pass, SSH_HANDSHAKE_TIMEOUT_MS);
+        }
+    }
+
     if (rc != 0) {
         log_session_error("Auth");
         ESP_LOGE(TAG, "Auth failed: rc=%d", rc);
+        if (s_last_connect_error[0] == '\0') {
+            set_last_connect_error("authentication failed (rc=%d)", rc);
+        }
         libssh2_session_free(session); session = NULL;
         libssh2_exit();
         close(ssh_sock); ssh_sock = -1;
@@ -957,11 +2028,19 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     }
     ESP_LOGI(TAG, "Auth OK, opening channel...");
 
+    /* Use non-blocking mode for channel request flow and drive waits explicitly.
+     * This avoids long blocking stalls during PTY/shell negotiation on some hosts. */
+    if (!set_socket_blocking_mode(ssh_sock, false)) {
+        ESP_LOGW(TAG, "Failed to switch SSH socket to non-blocking mode before channel setup");
+    }
+    libssh2_session_set_blocking(session, 0);
+
     channel = ssh_channel_open_with_timeout(SSH_HANDSHAKE_TIMEOUT_MS);
     if (!channel) {
         char *errmsg; int errmsg_len;
         int errcode = libssh2_session_last_error(session, &errmsg, &errmsg_len, 0);
         ESP_LOGE(TAG, "Channel open failed: %d %s", errcode, errmsg);
+        set_last_connect_error("channel open failed");
         libssh2_session_free(session); session = NULL;
         libssh2_exit();
         close(ssh_sock); ssh_sock = -1;
@@ -970,28 +2049,219 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         return false;
     }
 
-    // Keep channel non-blocking during PTY/shell startup so timeout wrappers
-    // can handle EAGAIN instead of blocking inside libssh2 internals.
     libssh2_channel_set_blocking(channel, 0);
 
     ESP_LOGI(TAG, "Channel open OK, requesting PTY...");
 
     rc = ssh_channel_request_pty_with_timeout(channel, "xterm-256color", SSH_HANDSHAKE_TIMEOUT_MS);
-    if (rc == 0 && ssh_term) {
-        libssh2_channel_request_pty_size(channel,
-                                         ssh_term->cols,
-                                         ssh_term->rows);
-    }
+    /* Terminal dimensions are sent inside pty-req; no separate
+     * window-change request (Go SSH server compatibility). */
     if (rc != 0) {
         ESP_LOGW(TAG, "PTY request failed (non-fatal): %d", rc);
     }
     ESP_LOGI(TAG, "Requesting shell...");
 
+#if SSH_VERBOSE_LOGS
+    s_ssh_trace_budget = 2500;
+#endif
+
+    bool used_no_reply_shell = false;
     rc = ssh_channel_shell_with_timeout(channel, SSH_HANDSHAKE_TIMEOUT_MS);
+    if (rc != 0 && rc == LIBSSH2_ERROR_TIMEOUT) {
+        ESP_LOGW(TAG, "Shell request timed out after PTY; retrying alternate startup paths");
+
+        if (rc != 0) {
+            bool timed_out_shell_adopted = false;
+            if (channel && !libssh2_channel_eof(channel)) {
+                ESP_LOGW(TAG, "Trying to adopt timed-out shell channel via active probes");
+                if (ssh_channel_bootstrap_expect_output(channel, 2500, 8000)) {
+                    ESP_LOGI(TAG, "Timed-out shell channel produced output; adopting channel");
+                    rc = 0;
+                    timed_out_shell_adopted = true;
+                } else {
+                    ESP_LOGW(TAG, "Timed-out shell channel remained silent after probes");
+                    if (!libssh2_channel_eof(channel)) {
+                        int nr_rc = ssh_channel_shell_no_reply_with_timeout(channel, 5000);
+                        if (nr_rc == 0 && !libssh2_channel_eof(channel)) {
+                            ESP_LOGW(TAG,
+                                     "Timed-out shell channel accepted explicit no-reply shell request");
+                            if (ssh_channel_bootstrap_expect_output(channel, 2000, 6000)) {
+                                ESP_LOGI(TAG,
+                                         "Timed-out shell channel produced output after explicit no-reply shell");
+                            } else {
+                                ESP_LOGW(TAG,
+                                         "Timed-out shell channel still silent after explicit no-reply shell");
+                            }
+                            rc = 0;
+                            used_no_reply_shell = true;
+                            timed_out_shell_adopted = true;
+                        } else if (nr_rc != 0 && nr_rc != LIBSSH2_ERROR_TIMEOUT) {
+                            ESP_LOGW(TAG,
+                                     "Explicit no-reply shell request on timed-out channel failed rc=%d",
+                                     nr_rc);
+                        }
+                    }
+
+                    if (!timed_out_shell_adopted && !libssh2_channel_eof(channel)) {
+                        ESP_LOGW(TAG,
+                                 "Accepting timed-out shell channel without reply; server may omit shell success/failure");
+                        rc = 0;
+                        used_no_reply_shell = true;
+                        timed_out_shell_adopted = true;
+                    }
+                }
+            }
+
+            if (!timed_out_shell_adopted && channel) {
+                libssh2_channel_close(channel);
+                libssh2_channel_free(channel);
+                channel = NULL;
+            }
+        }
+
+        if (rc != 0) {
+            bool pty_no_reply_ok = ssh_open_pty_shell_no_reply_fallback("xterm", 10000, 8000, 2500) ||
+                                   ssh_open_pty_shell_no_reply_fallback("vt100", 10000, 8000, 2500);
+            if (pty_no_reply_ok) {
+                rc = 0;
+                used_no_reply_shell = true;
+            }
+        }
+
+        if (rc != 0) {
+            const char *no_reply_exec_cmds[] = {
+                "printf __DUMBESPTY_EXEC_READY__\\n; exec bash -il",
+                "printf __DUMBESPTY_EXEC_READY__\\n; exec sh -il",
+                "printf __DUMBESPTY_EXEC_READY__\\n; exec /bin/bash -il",
+                "printf __DUMBESPTY_EXEC_READY__\\n; exec /bin/sh -il"
+            };
+
+            bool pty_no_reply_exec_ok = false;
+            for (size_t i = 0; i < sizeof(no_reply_exec_cmds) / sizeof(no_reply_exec_cmds[0]) && !pty_no_reply_exec_ok; i++) {
+                pty_no_reply_exec_ok = ssh_open_pty_exec_no_reply_fallback("xterm", no_reply_exec_cmds[i], 10000, 10000, 3000) ||
+                                       ssh_open_pty_exec_no_reply_fallback("vt100", no_reply_exec_cmds[i], 10000, 10000, 3000);
+            }
+
+            if (pty_no_reply_exec_ok) {
+                rc = 0;
+                used_no_reply_shell = true;
+            }
+        }
+
+        if (rc != 0) {
+            bool pty_retry_ok = ssh_open_pty_shell_fallback("xterm", 10000, 25000, 2500) ||
+                                ssh_open_pty_shell_fallback("vt100", 10000, 25000, 2500);
+            rc = pty_retry_ok ? 0 : LIBSSH2_ERROR_TIMEOUT;
+        }
+
+        if (rc != 0 && ssh_open_shell_no_pty_fallback(30000, 2500)) {
+            rc = 0;
+        }
+
+        if (rc != 0 && ssh_open_raw_channel_fallback(2500)) {
+            ESP_LOGI(TAG, "Using raw channel fallback (no shell/exec request)");
+            rc = 0;
+        }
+
+        if (rc != 0) {
+            const char *pty_exec_cmds[] = {
+                "exec bash -il",
+                "exec sh -il",
+                "bash -il",
+                "sh -il",
+                "/bin/bash -il",
+                "/bin/sh -il"
+            };
+
+            bool pty_exec_ok = false;
+            for (size_t i = 0; i < sizeof(pty_exec_cmds) / sizeof(pty_exec_cmds[0]) && !pty_exec_ok; i++) {
+                pty_exec_ok = ssh_open_pty_exec_fallback("xterm", pty_exec_cmds[i], 10000, 15000, 2500) ||
+                              ssh_open_pty_exec_fallback("vt100", pty_exec_cmds[i], 10000, 15000, 2500);
+            }
+
+            rc = pty_exec_ok ? 0 : rc;
+        }
+
+        if (rc != 0) {
+            const char *fallback_cmds[] = {
+                "exec bash -i",
+                "exec sh -i",
+                "exec /bin/sh -i",
+                "bash -il",
+                "sh -il",
+                "/bin/sh -il",
+                "/bin/sh"
+            };
+
+            for (size_t i = 0; i < sizeof(fallback_cmds) / sizeof(fallback_cmds[0]); i++) {
+                channel = ssh_channel_open_with_timeout(10000);
+                if (!channel) {
+                    rc = LIBSSH2_ERROR_CHANNEL_FAILURE;
+                    continue;
+                }
+
+                libssh2_channel_set_blocking(channel, 0);
+                rc = ssh_channel_exec_with_timeout(channel, fallback_cmds[i], 10000);
+                if (rc == 0 && ssh_channel_stays_open_briefly(channel, 1800)) {
+                    ESP_LOGI(TAG, "Shell fallback exec succeeded: %s", fallback_cmds[i]);
+                    break;
+                }
+
+                if (rc == 0) {
+                    ESP_LOGW(TAG, "Fallback exec closed immediately: %s", fallback_cmds[i]);
+                    rc = LIBSSH2_ERROR_CHANNEL_CLOSED;
+                }
+
+                libssh2_channel_close(channel);
+                libssh2_channel_free(channel);
+                channel = NULL;
+            }
+
+            if (rc != 0) {
+                channel = ssh_channel_open_with_timeout(10000);
+                if (channel) {
+                    libssh2_channel_set_blocking(channel, 0);
+                    rc = ssh_channel_shell_with_timeout(channel, 15000);
+                    if (rc == 0 && ssh_channel_stays_open_briefly(channel, 1800)) {
+                        ESP_LOGI(TAG, "Shell request succeeded without PTY fallback");
+                    } else {
+                        if (rc == 0) {
+                            ESP_LOGW(TAG, "No-PTY shell opened then closed immediately");
+                            rc = LIBSSH2_ERROR_CHANNEL_CLOSED;
+                        }
+                        libssh2_channel_close(channel);
+                        libssh2_channel_free(channel);
+                        channel = NULL;
+                    }
+                }
+            }
+        }
+    }
+
+    if (channel && libssh2_channel_eof(channel)) {
+        ESP_LOGW(TAG, "Shell channel closed before session became interactive");
+
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+        channel = NULL;
+
+        if (ssh_open_raw_channel_fallback(2500)) {
+            ESP_LOGI(TAG, "Recovered with raw channel fallback after EOF");
+            rc = 0;
+        } else {
+            rc = LIBSSH2_ERROR_CHANNEL_CLOSED;
+        }
+    }
+
     if (rc != 0) {
         log_session_error("Shell request");
         ESP_LOGE(TAG, "Shell request failed: %d", rc);
-        libssh2_channel_close(channel); channel = NULL;
+        set_last_connect_error("shell request failed");
+        if (channel) {
+            libssh2_channel_close(channel);
+            libssh2_channel_free(channel);
+            channel = NULL;
+        }
         libssh2_session_free(session); session = NULL;
         libssh2_exit();
         close(ssh_sock); ssh_sock = -1;
@@ -1000,9 +2270,12 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         return false;
     }
 
+    libssh2_channel_handle_extended_data2(channel, LIBSSH2_CHANNEL_EXTENDED_DATA_MERGE);
+
     ssh_rx_queue = create_rx_queue_with_fallback();
     if (!ssh_rx_queue) {
         ESP_LOGE(TAG, "Failed to create rx queue");
+        set_last_connect_error("rx queue allocation failed");
         libssh2_channel_close(channel);
         libssh2_channel_free(channel);
         channel = NULL;
@@ -1015,9 +2288,22 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
     ssh_connected = true;
     s_rx_trace_budget = 160;
+    s_rx_preview_budget = 40;
     s_rx_prev_tail = 0;
     s_rx_loop_budget = 120;
     s_queue_drain_budget = 80;
+    s_rx_raw_total = 0;
+    s_rx_forwarded_total = 0;
+    s_rx_filtered_total = 0;
+    s_rx_queue_drop_total = 0;
+    s_rx_raw_prev = 0;
+    s_rx_forwarded_prev = 0;
+    s_rx_filtered_prev = 0;
+    s_rx_queue_drop_prev = 0;
+    s_rx_diag_last_log = xTaskGetTickCount();
+    s_rx_diag_budget = 120;
+    s_tx_total = 0;
+    s_tx_prev = 0;
 
     ESP_LOGI(TAG,
              "Negotiated: kex=%s hostkey=%s c2s=%s s2c=%s mac_c2s=%s mac_s2c=%s",
@@ -1028,11 +2314,16 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
              safe_method_name(LIBSSH2_METHOD_MAC_CS),
              safe_method_name(LIBSSH2_METHOD_MAC_SC));
 
-    /* Return to non-blocking mode for interactive operation loops. */
+    /* Keep non-blocking mode for interactive operation loops. */
+    libssh2_channel_set_blocking(channel, 0);
     if (!set_socket_blocking_mode(ssh_sock, false)) {
         ESP_LOGW(TAG, "Failed to restore SSH socket non-blocking mode");
     }
-    libssh2_session_set_blocking(session, 0);
+    if (session) {
+        libssh2_session_set_blocking(session, 0);
+    } else {
+        ESP_LOGW(TAG, "Session disappeared before non-blocking restore");
+    }
 
 #if SSH_USE_RX_TASK
     ESP_LOGD(TAG, "Starting SSH recv task...");
@@ -1061,6 +2352,73 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     coex_release();
 
     ESP_LOGI(TAG, "SSH connected to %s:%d as %s", host, port, user);
+
+    /* Kick interactive prompt on hosts that wait for first line input. */
+    int kick_rc = ssh_write("\r\n", 2);
+    if (kick_rc < 0) {
+        ESP_LOGW(TAG, "Initial prompt kick write failed: %d", kick_rc);
+    }
+
+    if (used_no_reply_shell) {
+        bool saw_data = false;
+        static const char *probe_seq[] = {
+            "\r",
+            "\n",
+            "\r\n",
+            " "
+        };
+        static const int probe_len[] = {1, 1, 2, 1};
+
+        for (size_t i = 0; i < sizeof(probe_seq) / sizeof(probe_seq[0]); i++) {
+            int wr = ssh_write(probe_seq[i], probe_len[i]);
+            if (wr < 0) {
+                ESP_LOGW(TAG, "No-reply shell bootstrap write failed at try %u: %d", (unsigned)(i + 1), wr);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(150));
+            ssh_pump_rx_once(8);
+            if (ssh_rx_queue && uxQueueMessagesWaiting(ssh_rx_queue) > 0) {
+                ESP_LOGI(TAG, "No-reply shell bootstrap received remote data on try %u", (unsigned)(i + 1));
+                saw_data = true;
+                break;
+            }
+        }
+        if (!saw_data) {
+            static const char *force_cmd = "echo __DUMBESPTY_READY__\r";
+            int wr = ssh_write(force_cmd, (int)strlen(force_cmd));
+            if (wr >= 0) {
+                for (int i = 0; i < 12; i++) {
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                    ssh_pump_rx_once(8);
+                    if (ssh_rx_queue && uxQueueMessagesWaiting(ssh_rx_queue) > 0) {
+                        ESP_LOGI(TAG, "No-reply shell produced output after forced echo probe");
+                        saw_data = true;
+                        break;
+                    }
+                }
+            } else {
+                ESP_LOGW(TAG, "No-reply shell forced echo probe write failed: %d", wr);
+            }
+        }
+
+        if (!saw_data) {
+            TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(12000);
+            while (xTaskGetTickCount() < deadline) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                ssh_pump_rx_once(8);
+                if (ssh_rx_queue && uxQueueMessagesWaiting(ssh_rx_queue) > 0) {
+                    ESP_LOGI(TAG, "No-reply shell produced delayed output during wait window");
+                    saw_data = true;
+                    break;
+                }
+            }
+        }
+
+        if (!saw_data) {
+            ESP_LOGW(TAG, "No-reply shell bootstrap completed with no remote output");
+        }
+    }
+
     return true;
     }
 }
@@ -1074,6 +2432,8 @@ void ssh_disconnect(void) {
     }
 
     if (channel) {
+        int exit_status = libssh2_channel_get_exit_status(channel);
+        ESP_LOGI(TAG, "Closing channel (exit_status=%d)", exit_status);
         libssh2_channel_send_eof(channel);
         libssh2_channel_wait_eof(channel);
         libssh2_channel_close(channel);
@@ -1127,6 +2487,7 @@ int ssh_write(const char *data, int len) {
             xSemaphoreGive(ssh_write_mutex);
             return rc;
         }
+        s_tx_total += (uint32_t)rc;
         total += rc;
     }
     xSemaphoreGive(ssh_write_mutex);
@@ -1151,7 +2512,41 @@ void ssh_process_queue(void) {
 
     if (drained > 0 && s_queue_drain_budget > 0) s_queue_drain_budget--;
 
-    if (!ssh_connected) {
+    if (ssh_connected && s_rx_diag_budget > 0) {
+        TickType_t now = xTaskGetTickCount();
+        if (now - s_rx_diag_last_log >= pdMS_TO_TICKS(1000)) {
+            uint32_t raw_delta = s_rx_raw_total - s_rx_raw_prev;
+            uint32_t fwd_delta = s_rx_forwarded_total - s_rx_forwarded_prev;
+            uint32_t filt_delta = s_rx_filtered_total - s_rx_filtered_prev;
+            uint32_t drop_delta = s_rx_queue_drop_total - s_rx_queue_drop_prev;
+            uint32_t tx_delta = s_tx_total - s_tx_prev;
+            uint32_t q_depth = ssh_rx_queue ? (uint32_t)uxQueueMessagesWaiting(ssh_rx_queue) : 0;
+
+            ESP_LOGI(TAG,
+                     "IO diag d(rx=%u fwd=%u filt=%u drop=%u tx=%u q=%u) t(rx=%u fwd=%u filt=%u drop=%u tx=%u)",
+                     (unsigned)raw_delta,
+                     (unsigned)fwd_delta,
+                     (unsigned)filt_delta,
+                     (unsigned)drop_delta,
+                     (unsigned)tx_delta,
+                     (unsigned)q_depth,
+                     (unsigned)s_rx_raw_total,
+                     (unsigned)s_rx_forwarded_total,
+                     (unsigned)s_rx_filtered_total,
+                     (unsigned)s_rx_queue_drop_total,
+                     (unsigned)s_tx_total);
+
+            s_rx_raw_prev = s_rx_raw_total;
+            s_rx_forwarded_prev = s_rx_forwarded_total;
+            s_rx_filtered_prev = s_rx_filtered_total;
+            s_rx_queue_drop_prev = s_rx_queue_drop_total;
+            s_tx_prev = s_tx_total;
+            s_rx_diag_last_log = now;
+            s_rx_diag_budget--;
+        }
+    }
+
+    if (!ssh_connected && !s_ssh_connecting) {
         if (channel || session || ssh_sock >= 0) {
             ssh_disconnect();
         }

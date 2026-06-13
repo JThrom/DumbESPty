@@ -25,8 +25,8 @@ static constexpr size_t SALT_LEN = 16;
 static constexpr size_t NONCE_LEN = 12;
 static constexpr size_t TAG_LEN = 16;
 static constexpr size_t KEY_LEN = 32;
-static constexpr size_t MAX_SECRET_LEN = 256;
-static constexpr size_t MAX_BLOB_LEN = 1024;
+static constexpr size_t MAX_SECRET_LEN = 4096;
+static constexpr size_t MAX_BLOB_LEN = 4200;
 static constexpr int MAX_VAULT_KEYS = 32;
 static constexpr uint32_t KDF_YIELD_INTERVAL = 32;
 
@@ -253,9 +253,23 @@ esp_err_t secret_vault_store(const char *key, const char *value, const char *vau
     if (value_len == 0 || value_len > MAX_SECRET_LEN) return ESP_ERR_INVALID_SIZE;
 
     uint8_t aes_key[KEY_LEN] = {0};
-    uint8_t ciphertext[MAX_SECRET_LEN] = {0};
-    uint8_t aead_out[MAX_SECRET_LEN + TAG_LEN] = {0};
     vault_hdr_t hdr = {};
+
+    uint8_t *ciphertext = (uint8_t *)calloc(value_len, 1);
+    uint8_t *aead_out = (uint8_t *)calloc(value_len + TAG_LEN, 1);
+    uint8_t *blob = NULL;
+    if (!ciphertext || !aead_out) {
+        secure_zero(aes_key, sizeof(aes_key));
+        if (ciphertext) {
+            secure_zero(ciphertext, value_len);
+            free(ciphertext);
+        }
+        if (aead_out) {
+            secure_zero(aead_out, value_len + TAG_LEN);
+            free(aead_out);
+        }
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_fill_random(hdr.salt, SALT_LEN);
     esp_fill_random(hdr.nonce, NONCE_LEN);
@@ -267,6 +281,10 @@ esp_err_t secret_vault_store(const char *key, const char *value, const char *vau
     err = derive_key(vault_pass, hdr.salt, SALT_LEN, aes_key);
     if (err != ESP_OK) {
         secure_zero(aes_key, sizeof(aes_key));
+        secure_zero(ciphertext, value_len);
+        secure_zero(aead_out, value_len + TAG_LEN);
+        free(ciphertext);
+        free(aead_out);
         return err;
     }
 
@@ -283,26 +301,40 @@ esp_err_t secret_vault_store(const char *key, const char *value, const char *vau
                               (const uint8_t *)value,
                               value_len,
                               aead_out,
-                              sizeof(aead_out),
+                              value_len + TAG_LEN,
                               &aead_out_len);
         psa_destroy_key(key_id);
     }
     if (st != PSA_SUCCESS || aead_out_len != value_len + TAG_LEN) {
         secure_zero(aes_key, sizeof(aes_key));
-        secure_zero(aead_out, sizeof(aead_out));
+        secure_zero(ciphertext, value_len);
+        secure_zero(aead_out, value_len + TAG_LEN);
+        free(ciphertext);
+        free(aead_out);
         return ESP_FAIL;
     }
 
     memcpy(ciphertext, aead_out, value_len);
     memcpy(hdr.tag, aead_out + value_len, TAG_LEN);
 
-    uint8_t blob[MAX_BLOB_LEN] = {0};
     const size_t blob_len = sizeof(hdr) + value_len;
-    if (blob_len > sizeof(blob)) {
+    if (blob_len > MAX_BLOB_LEN) {
         secure_zero(aes_key, sizeof(aes_key));
-        secure_zero(ciphertext, sizeof(ciphertext));
-        secure_zero(aead_out, sizeof(aead_out));
+        secure_zero(ciphertext, value_len);
+        secure_zero(aead_out, value_len + TAG_LEN);
+        free(ciphertext);
+        free(aead_out);
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    blob = (uint8_t *)calloc(blob_len, 1);
+    if (!blob) {
+        secure_zero(aes_key, sizeof(aes_key));
+        secure_zero(ciphertext, value_len);
+        secure_zero(aead_out, value_len + TAG_LEN);
+        free(ciphertext);
+        free(aead_out);
+        return ESP_ERR_NO_MEM;
     }
 
     memcpy(blob, &hdr, sizeof(hdr));
@@ -317,9 +349,12 @@ esp_err_t secret_vault_store(const char *key, const char *value, const char *vau
     }
 
     secure_zero(aes_key, sizeof(aes_key));
-    secure_zero(ciphertext, sizeof(ciphertext));
-    secure_zero(aead_out, sizeof(aead_out));
-    secure_zero(blob, sizeof(blob));
+    secure_zero(ciphertext, value_len);
+    secure_zero(aead_out, value_len + TAG_LEN);
+    secure_zero(blob, blob_len);
+    free(ciphertext);
+    free(aead_out);
+    free(blob);
     return err;
 }
 
@@ -330,28 +365,49 @@ esp_err_t secret_vault_load(const char *key, const char *vault_pass, char *out, 
     esp_err_t err = secret_vault_password_check(vault_pass);
     if (err != ESP_OK) return err;
 
-    uint8_t blob[MAX_BLOB_LEN] = {0};
-    size_t blob_len = sizeof(blob);
+    size_t blob_len = 0;
     nvs_handle_t nvs = 0;
     err = nvs_open(VAULT_NS, NVS_READONLY, &nvs);
     if (err != ESP_OK) return err;
+    err = nvs_get_blob(nvs, key, NULL, &blob_len);
+    if (err != ESP_OK) {
+        nvs_close(nvs);
+        return err;
+    }
+    if (blob_len < sizeof(vault_hdr_t) || blob_len > MAX_BLOB_LEN) {
+        nvs_close(nvs);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *blob = (uint8_t *)calloc(blob_len, 1);
+    if (!blob) {
+        nvs_close(nvs);
+        return ESP_ERR_NO_MEM;
+    }
     err = nvs_get_blob(nvs, key, blob, &blob_len);
     nvs_close(nvs);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        secure_zero(blob, blob_len);
+        free(blob);
+        return err;
+    }
 
     if (blob_len < sizeof(vault_hdr_t)) {
-        secure_zero(blob, sizeof(blob));
+        secure_zero(blob, blob_len);
+        free(blob);
         return ESP_ERR_INVALID_SIZE;
     }
 
     vault_hdr_t hdr = {};
     memcpy(&hdr, blob, sizeof(hdr));
     if (hdr.magic != VAULT_MAGIC || hdr.version != VAULT_VERSION || hdr.ciphertext_len == 0) {
-        secure_zero(blob, sizeof(blob));
+        secure_zero(blob, blob_len);
+        free(blob);
         return ESP_ERR_INVALID_RESPONSE;
     }
     if ((size_t)hdr.ciphertext_len + sizeof(hdr) != blob_len || hdr.ciphertext_len >= out_cap) {
-        secure_zero(blob, sizeof(blob));
+        secure_zero(blob, blob_len);
+        free(blob);
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -359,12 +415,19 @@ esp_err_t secret_vault_load(const char *key, const char *vault_pass, char *out, 
     uint8_t aes_key[KEY_LEN] = {0};
     err = derive_key(vault_pass, hdr.salt, SALT_LEN, aes_key);
     if (err != ESP_OK) {
-        secure_zero(blob, sizeof(blob));
+        secure_zero(blob, blob_len);
+        free(blob);
         secure_zero(aes_key, sizeof(aes_key));
         return err;
     }
 
-    uint8_t aead_in[MAX_SECRET_LEN + TAG_LEN] = {0};
+    uint8_t *aead_in = (uint8_t *)calloc(hdr.ciphertext_len + TAG_LEN, 1);
+    if (!aead_in) {
+        secure_zero(blob, blob_len);
+        free(blob);
+        secure_zero(aes_key, sizeof(aes_key));
+        return ESP_ERR_NO_MEM;
+    }
     memcpy(aead_in, ciphertext, hdr.ciphertext_len);
     memcpy(aead_in + hdr.ciphertext_len, hdr.tag, TAG_LEN);
 
@@ -386,9 +449,11 @@ esp_err_t secret_vault_load(const char *key, const char *vault_pass, char *out, 
         psa_destroy_key(key_id);
     }
 
-    secure_zero(blob, sizeof(blob));
+    secure_zero(blob, blob_len);
     secure_zero(aes_key, sizeof(aes_key));
-    secure_zero(aead_in, sizeof(aead_in));
+    secure_zero(aead_in, hdr.ciphertext_len + TAG_LEN);
+    free(blob);
+    free(aead_in);
 
     if (st != PSA_SUCCESS || dec_len != hdr.ciphertext_len) {
         secure_zero(out, out_cap);
@@ -446,10 +511,12 @@ esp_err_t secret_vault_rekey(const char *old_vault_pass, const char *new_vault_p
     nvs_release_iterator(it);
 
     for (int i = 0; i < key_count; i++) {
-        char plain[MAX_SECRET_LEN + 1] = {0};
-        err = secret_vault_load(keys[i], old_vault_pass, plain, sizeof(plain));
+        char *plain = (char *)calloc(MAX_SECRET_LEN + 1, 1);
+        if (!plain) return ESP_ERR_NO_MEM;
+        err = secret_vault_load(keys[i], old_vault_pass, plain, MAX_SECRET_LEN + 1);
         if (err != ESP_OK) {
-            secure_zero(plain, sizeof(plain));
+            secure_zero(plain, MAX_SECRET_LEN + 1);
+            free(plain);
             return err;
         }
 
@@ -458,7 +525,8 @@ esp_err_t secret_vault_rekey(const char *old_vault_pass, const char *new_vault_p
         esp_fill_random(set_salt, SALT_LEN);
         err = derive_key(new_vault_pass, set_salt, SALT_LEN, new_hash);
         if (err != ESP_OK) {
-            secure_zero(plain, sizeof(plain));
+            secure_zero(plain, MAX_SECRET_LEN + 1);
+            free(plain);
             secure_zero(set_salt, sizeof(set_salt));
             secure_zero(new_hash, sizeof(new_hash));
             return err;
@@ -467,12 +535,14 @@ esp_err_t secret_vault_rekey(const char *old_vault_pass, const char *new_vault_p
         secure_zero(set_salt, sizeof(set_salt));
         secure_zero(new_hash, sizeof(new_hash));
         if (err != ESP_OK) {
-            secure_zero(plain, sizeof(plain));
+            secure_zero(plain, MAX_SECRET_LEN + 1);
+            free(plain);
             return err;
         }
 
         err = secret_vault_store(keys[i], plain, new_vault_pass);
-        secure_zero(plain, sizeof(plain));
+        secure_zero(plain, MAX_SECRET_LEN + 1);
+        free(plain);
         if (err != ESP_OK) return err;
     }
 

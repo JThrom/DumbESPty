@@ -24,13 +24,17 @@ LazyVim rendering stability.
   - `ssh user@host[:port]`
 - SSH auth behavior probes first, then uses `none` / `keyboard-interactive` /
   `password` paths as available.
-- High-priority gap: current client build does not support `ssh-ed25519`
-  host keys, so ed25519-only servers fail during handshake.
+- `ssh-ed25519` host keys are now supported (libssh2 fork, ref10 verify in
+  mbedTLS backend); ed25519-only servers such as `terminal.shop` work
+  end-to-end (2026-06).
+- Go-based SSH servers (x/crypto/ssh, wish/charm) are now compatible:
+  terminal dimensions are sent inside `pty-req` and no separate
+  `window-change` request is issued during session startup.
 
 ## SSH Compatibility Roadmap (Phased)
 
-1. Phase 1: host key compatibility
-   - Add client support for `ssh-ed25519` host keys.
+1. Phase 1: host key compatibility (DONE 2026-06)
+   - Client supports `ssh-ed25519` host keys via libssh2 fork.
 2. Phase 2: auth method coverage
    - Ensure robust `publickey`, `keyboard-interactive`, `password`, `none`
      negotiation behavior.
@@ -86,6 +90,14 @@ Compatibility implemented for active editor/shell scenarios:
 - `CSI d` (VPA: vertical position absolute) implemented
 - `CSI > ... q` and `CSI > ... u` variants consumed to reduce compatibility warning noise
 - UTF-8 continuation bytes are consumed before C1 checks in ground state, preventing icon bytes (for example `U+F15B` -> `EF 85 9B`) from being misparsed as CSI
+- OSC 10/11 color queries (`OSC 10;?` / `OSC 11;?`) are answered with the
+  default palette (`rgb:0000/ffff/0000` fg, `rgb:0000/0000/0000` bg);
+  bubbletea/lipgloss TUI apps block at startup waiting for these replies
+- OSC strings terminated with ST (`ESC \`) are now dispatched (previously
+  only BEL/0x9C terminators dispatched, so ST-terminated queries were lost)
+- `terminal_write` is serialized with a mutex (created in `terminal_init`);
+  the parser is a stateful byte-stream machine and concurrent writers
+  (SSH connect task vs main-loop RX drain) corrupted escape sequences
 
 Rendering notes:
 - Uses Cozette bitmap font with LVGL fallback font path
@@ -112,13 +124,27 @@ Stability hardening:
   - corrected mbedTLS v3 HMAC setup flow
 - strict-KEX handling corrected to avoid unilateral sequence resets after NEWKEYS
 - auth flow includes method probe and keyboard-interactive fallback
-- current high-priority limitation: no `ssh-ed25519` host key support in this build
+- auth order now prefers `none`, then `publickey` (when a key is loaded), then password-style fallback
+- hostkey preference ordering is now built dynamically from client-supported algorithms (prefers `ssh-ed25519`, then ECDSA, then RSA where available)
+- server hostkey fingerprint (SHA1) is logged after handshake as Phase 4 trust-model groundwork
+- host trust uses initial TOFU persistence and rejects host key mismatches for previously seen `host:port`
+- `ssh-ed25519` host keys supported via libssh2 fork (`../../libssh2_esp`,
+  `override_path` in `main/idf_component.yml`): ed25519 verification uses
+  vendored ref10 code in the mbedTLS backend
+- PTY request sends terminal dimensions inside `pty-req` itself
+  (`libssh2_channel_request_pty_ex`); no separate `window-change` request is
+  sent during session startup because Go-based SSH servers stop servicing
+  channel requests in that ordering (shell request never answered)
+- known limitation: `curve25519-sha256` KEX in the fork requires PSA crypto
+  (`MBEDTLS_PSA_CRYPTO_C`), which is not enabled in ESP-IDF's mbedTLS config;
+  the conservative profile prefers `ecdh-sha2-nistp256`, which works
 
 ### Shell (`main/shell.cpp`, `main/shell.hpp`)
 
 - Local command processing (`help`, `wifi`, `ssh`, etc.)
 - SSH passthrough mode toggling
 - Password capture callback support (deferred until required by auth probe)
+- `sshkey` shell command adds vault-backed private-key import/load and runtime key management
 - Escape/arrow/backspace handling integrated with terminal write path
 
 ### BLE HID Host (`main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`)
@@ -179,24 +205,38 @@ idf.py -p /dev/ttyACM0 flash
 
 ## Current Bug Worklist
 
-### 0) SSH host key compatibility gap (highest priority, open)
+### 0) terminal.shop / Go SSH server compatibility (resolved 2026-06)
 
-Observed:
-- servers offering only `ssh-ed25519` host key fail at handshake with:
-  - `session_handshake rc=-5`
-  - `Unable to exchange encryption keys`
+Originally observed:
+- servers offering only `ssh-ed25519` host key failed at handshake with
+  `session_handshake rc=-5` / `rc=-8`, `Unable to exchange encryption keys`.
+- after hostkey support was added, sessions connected but the screen stayed
+  blank: `shell` request timed out and zero RX bytes ever arrived.
+- after the shell fix, the OSC color query rendered as literal `]10;?` text
+  and the TUI never started.
 
-Current diagnostics confirm:
-- client hostkey algorithm list currently includes ECDSA/RSA variants only.
-- `ssh-ed25519` is not advertised by this build.
+Root causes found (validated with a host-side Linux build of the forked
+libssh2 + ESP-IDF mbedTLS 3.6.4 connecting to terminal.shop):
+
+1. No `ssh-ed25519` support in libssh2 mbedTLS backend
+   (`LIBSSH2_ED25519 0`): no hostkey overlap with ed25519-only servers.
+   Fixed in the libssh2 fork with vendored ref10 ed25519 verification.
+2. `window-change` request sent between `pty-req` and `shell` wedges
+   Go-based SSH servers: the server stops servicing channel requests and
+   never answers `shell`. Fixed by passing dimensions inside `pty-req`
+   (`libssh2_channel_request_pty_ex`) and removing all startup
+   window-change requests.
+3. bubbletea/lipgloss TUI apps probe `OSC 10;?`, `OSC 11;?`, `CSI 6n`,
+   `CSI c` at startup and wait for each reply before drawing. The terminal
+   did not answer OSC color queries and dropped ST-terminated OSC strings.
+   Fixed in `terminal.cpp` (OSC 10/11 replies + ST dispatch).
+4. Concurrent `terminal_write` calls (SSH connect task post-connect clear
+   vs main-loop RX drain) interleaved bytes mid-escape-sequence, printing
+   query text on screen and clobbering CSI params so replies were skipped.
+   Fixed with a `terminal_write` mutex.
 
 Current status:
-- open.
-
-Planned next steps:
-1. enable `ssh-ed25519` host key support in client stack (Phase 1 roadmap)
-2. re-test against ed25519-only hosts and mixed-hostkey hosts
-3. keep ECDSA/RSA fallback compatibility
+- resolved; `ssh terminal.shop` renders the full TUI on device.
 
 ### 0.1) SSH handshake/auth regression (resolved in prior cycle)
 
@@ -319,8 +359,21 @@ Planned next steps:
 ## Known-Good Baseline (Current)
 
 - LazyVim main screen loads after DCS rollback.
+- `ssh terminal.shop` (Go server, ed25519-only hostkey, bubbletea TUI)
+  connects and renders end-to-end.
+- Password-auth servers (e.g. local OpenSSH hosts) continue to work with
+  the same flow.
 - Updated Nerd symbol font includes the three known missing glyphs.
 - Firmware builds and flashes successfully to `/dev/ttyACM0`.
+
+## Build Reproducibility Note
+
+The libssh2 fork at `../../libssh2_esp` (used via `override_path` in
+`main/idf_component.yml`) currently carries uncommitted changes in both the
+component repo and its `libssh2` submodule (ed25519 ref10 files, mbedtls
+backend, kex/session/channel patches). The firmware cannot be rebuilt
+identically from a clean checkout without that tree. Commit or vendor the
+fork before relying on fresh clones.
 
 ## Known Quirks and Workarounds
 
