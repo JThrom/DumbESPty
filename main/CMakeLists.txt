@@ -19,13 +19,15 @@ if(IDF_TARGET STREQUAL "esp32p4")
         "waveshare_display_p4.cpp"
         "coex_manager_stub.cpp"
         "ble_hid_host.cpp"
+        "usb_hid_host.cpp"
     )
-    set(extra_requires bt esp_hid)
+    set(extra_requires bt esp_hid usb espressif__usb_host_hid)
 else()
     list(APPEND srcs
         "waveshare_display.cpp"
         "coex_manager.cpp"
         "ble_hid_host.cpp"
+        "usb_hid_host.cpp"
     )
     set(extra_requires bt esp_hid)
 endif()

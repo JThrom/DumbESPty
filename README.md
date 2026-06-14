@@ -26,6 +26,7 @@ DumbESPty is a portable, color dumb-terminal style system built for Waveshare 7-
 
 - Wi-Fi station connectivity
 - BLE HID keyboard input
+- USB OTG HID keyboard input (wired keyboard on onboard OTG port)
 - VT100/xterm-style color terminal emulation rendered via LVGL
 - SSHv2 transport via libssh2
 
@@ -92,6 +93,8 @@ Phase 5 - Linux-like UX Polish
 ## Recent Feature Additions
 
 - Touch status menu with quick access to Wi-Fi and BLE state.
+- Wired USB keyboard support over onboard USB OTG host port.
+- Parallel keyboard input path: BLE HID and wired USB HID can be used together.
 - Expanded BLE keyboard management UI:
   - scan for keyboards,
   - pair by list selection,
@@ -173,7 +176,7 @@ Current note:
 - intermittent runtime `rc=-4` disconnects can still occur under some command
   workloads; this remains an active investigation item.
 
-## Status Menu and BLE Usage
+## Status Menu and Keyboard Usage
 
 1. Open the status menu from the top-right corner touch area.
 2. If no keyboard is paired:
@@ -185,6 +188,9 @@ Current note:
 
 Behavior notes:
 
+- Wired USB keyboard input is active when a compatible keyboard is connected to
+  the onboard OTG port.
+- BLE and wired USB keyboard input paths run in parallel.
 - Only one BLE keyboard is persisted at a time.
 - Pairing data is stored in NVS (`blehid` namespace), including address prefix and slot metadata.
 - Reconnect prefers full saved address when available, otherwise falls back to prefix-assisted scan/connect.
@@ -207,12 +213,14 @@ console_base.cpp
   -> ssh_client (libssh2 session + recv queue)
   -> wifi_mgr (station management)
   -> ble_hid_host (keyboard input)
+  -> usb_hid_host (wired keyboard input)
   -> waveshare_display/ch422g (display + control lines)
 ```
 
 Main loop responsibilities:
 
 - Process BLE queue
+- Process USB HID queue
 - Process Wi-Fi queue
 - Process SSH RX queue
 - Render terminal
@@ -230,6 +238,7 @@ Core modules in active use:
 - `main/shell.cpp`, `main/shell.hpp`
 - `main/wifi_mgr.cpp`, `main/wifi_mgr.hpp`
 - `main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`
+- `main/usb_hid_host.cpp`, `main/usb_hid_host.hpp`
 - `main/secret_vault.cpp`, `main/secret_vault.hpp`
 - `main/coex_manager.cpp`, `main/coex_manager_stub.cpp`, `main/coex_manager.hpp`
 - `main/waveshare_display_p4.cpp`, `main/include/waveshare_display.hpp`
@@ -307,6 +316,14 @@ Rendering notes:
   - FN-layer ESC surrogate mapping,
   - HID usage index alignment (`0x32` placeholder)
 
+### USB HID Host (`main/usb_hid_host.cpp`, `main/usb_hid_host.hpp`)
+
+- USB host + HID host initialization for wired keyboards on OTG port
+- Keyboard connect/disconnect event handling
+- Boot keyboard report parsing and key translation into shell input stream
+- Control/navigation mappings aligned with BLE path (`Ctrl+Shift+Up/Down`, arrows, delete)
+- Runs in parallel with BLE keyboard input path
+
 ### Wi-Fi Manager (`main/wifi_mgr.cpp`)
 
 - Station mode setup and connection lifecycle
@@ -343,7 +360,7 @@ The `about` command prints a full-color info screen including:
 - FreeRTOS version (runtime)
 - LVGL version (runtime macro values)
 - SSH transport: libssh2 version + non-blocking channel mode
-- Input paths: BLE HID host + USB serial console
+- Input paths: BLE HID host + USB OTG HID host + USB serial console
 
 ## Dependency Versions
 
@@ -352,12 +369,16 @@ Locked dependency versions from `dependencies.lock`:
 - `idf`: `6.1.0`
 - `lvgl/lvgl`: `9.5.0`
 - `skuodi/libssh2_esp`: `1.1.0`
+- `espressif/usb`: `1.1.0` (pinned for ESP32-P4 build compatibility)
+- `espressif/usb_host_hid`: `1.2.0`
 - `espressif/esp_lcd_touch`: `1.2.1`
 - `espressif/esp_lcd_touch_gt911`: `1.2.0~2`
 
 Direct dependency set:
 
 - `espressif/esp_lcd_touch_gt911`
+- `espressif/usb`
+- `espressif/usb_host_hid`
 - `idf`
 - `lvgl/lvgl`
 - `skuodi/libssh2_esp`
@@ -369,6 +390,8 @@ Project/component declarations:
 - Main component manifest constraints (`main/idf_component.yml`):
   - `idf >= 5.3.0`
   - `espressif/esp_lcd_touch_gt911 ^1.2.0~2`
+  - `espressif/usb =1.1.0` (ESP32-P4 rule)
+  - `espressif/usb_host_hid *` (ESP32-P4 rule)
   - `lvgl/lvgl ^9.4.0`
   - `skuodi/libssh2_esp ^1.1.0`
 
@@ -410,6 +433,7 @@ ESP32-P4 bring-up note (important):
 
 - BLE keyboard may disconnect or appear paused during Wi-Fi connect and active SSH usage because coexistence management can intentionally pause scan/disconnect BLE while network activity is acquired.
 - After Wi-Fi/SSH transitions, some keyboards require a keypress to wake and trigger reconnect.
+- Wired USB keyboard input is independent of BLE pairing state and remains available when OTG keyboard is attached.
 - This behavior is currently expected in the active coexistence model; if keyboard input appears dead after SSH/Wi-Fi events, press any key to prompt reconnect.
 
 ## Current Priority Bugs
