@@ -15,8 +15,15 @@ static const char *TAG = "TERM";
  * bytes mid-escape-sequence and corrupt parsing (observed: OSC swallowed,
  * CSI params clobbered, query replies lost). */
 static SemaphoreHandle_t s_term_write_lock = NULL;
-static int s_csi_trace_budget = 600;
+static constexpr bool kTermVerboseTrace = false;
+static int s_csi_trace_budget = kTermVerboseTrace ? 600 : 0;
 static int s_missing_glyph_budget = 32;
+
+#if CONFIG_IDF_TARGET_ESP32S3
+static constexpr bool kEnableGlyphHalo = true;
+#else
+static constexpr bool kEnableGlyphHalo = false;
+#endif
 
 #define GLYPH_ALPHA_THRESHOLD 1
 
@@ -722,7 +729,9 @@ static void csi_dispatch(terminal_t *term) {
         // Kitty keyboard protocol enable/disable/query; ignore for now.
     } else if (f == 'n') {
         int q = pop_param(term, 0, 0);
-        ESP_LOGI(TAG, "CSI %s%d n", term->question_mark ? "?" : "", q);
+        if (kTermVerboseTrace) {
+            ESP_LOGI(TAG, "CSI %s%d n", term->question_mark ? "?" : "", q);
+        }
         if (q == 5) {
             if (term->output_cb) {
                 if (term->question_mark) term->output_cb("\033[?0n", 5);
@@ -745,7 +754,9 @@ static void csi_dispatch(terminal_t *term) {
         else if (mode == 7) term->wraparound = true;
         else if (mode == 25) term->cursor_visible = true;
         else if (mode == 2004) {
-            ESP_LOGI(TAG, "Bracketed paste ON");
+            if (kTermVerboseTrace) {
+                ESP_LOGI(TAG, "Bracketed paste ON");
+            }
         }
         else if (mode == 1049 || mode == 47 || mode == 1047) {
             if (term->alt_screen) return;
@@ -761,7 +772,9 @@ static void csi_dispatch(terminal_t *term) {
         else if (mode == 7) term->wraparound = false;
         else if (mode == 25) term->cursor_visible = false;
         else if (mode == 2004) {
-            ESP_LOGI(TAG, "Bracketed paste OFF");
+            if (kTermVerboseTrace) {
+                ESP_LOGI(TAG, "Bracketed paste OFF");
+            }
         }
         else if (mode == 1049 || mode == 47 || mode == 1047) {
             if (!term->alt_screen) return;
@@ -1152,7 +1165,10 @@ static void draw_cell_glyph(const terminal_t *term,
     if (code < 0x20) return;
 
     uint16_t fg = compensate_text_color(color, surface_bg);
-    uint16_t halo = halo_color(surface_bg, fg);
+    uint16_t halo = 0;
+    if (kEnableGlyphHalo) {
+        halo = halo_color(surface_bg, fg);
+    }
 
     auto plot_in_cell = [&](int x, int y, uint16_t px) {
         if (x < cell_x || x >= cell_x + term->font_w) return;
@@ -1179,7 +1195,7 @@ static void draw_cell_glyph(const terminal_t *term,
                 for (int px = 0; px < (int)bg->box_w && gx + px < cw; px++) {
                     int xp = gx + px;
                     uint8_t b = row[px >> 3];
-                    if (b & (0x80 >> (px & 7))) {
+                    if (kEnableGlyphHalo && (b & (0x80 >> (px & 7)))) {
                         for (int dy = -1; dy <= 1; dy++)
                             for (int dx = -1; dx <= 1; dx++)
                                 if (dx || dy) plot_in_cell(xp + dx, yp + dy, halo);
@@ -1237,7 +1253,7 @@ static void draw_cell_glyph(const terminal_t *term,
         for (int px = 0; px < dsc.box_w && gx + px < cw; px++) {
             int xp = gx + px;
             int a = a8[py * gstride + px];
-            if (a >= GLYPH_ALPHA_THRESHOLD) {
+            if (kEnableGlyphHalo && a >= GLYPH_ALPHA_THRESHOLD) {
                 for (int dy = -1; dy <= 1; dy++)
                     for (int dx = -1; dx <= 1; dx++)
                         if (dx || dy) plot_in_cell(xp + dx, yp + dy, halo);

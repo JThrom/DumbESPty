@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "tailscale_mgr.hpp"
+#include "waveshare_display.hpp"
 #include "wifi_mgr.hpp"
 
 static const char *TAG = "ui_menu";
@@ -52,10 +53,13 @@ static lv_obj_t *s_ble_btn_disconnect = NULL;
 static lv_obj_t *s_ble_btn_scan_label = NULL;
 static lv_obj_t *s_ble_btn_disconnect_label = NULL;
 static lv_obj_t *s_ble_list = NULL;
+static lv_obj_t *s_brightness_label = NULL;
+static lv_obj_t *s_brightness_slider = NULL;
 static bool s_expanded_state = false;
 static int64_t s_last_update_us = 0;
 static int64_t s_last_touch_err_log_us = 0;
 static uint32_t s_last_ble_scan_generation = 0;
+static int s_last_brightness_percent = -1;
 
 static i2c_master_bus_handle_t get_touch_i2c_bus(void) {
 #if CONFIG_IDF_TARGET_ESP32P4
@@ -220,6 +224,19 @@ static void ble_pick_event_cb(lv_event_t *e) {
     ble_hid_pair_scan_index((int)idx);
 }
 
+static void brightness_slider_event_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    if (!s_brightness_slider || !s_brightness_label) return;
+
+    const int percent = lv_slider_get_value(s_brightness_slider);
+    waveshare_display_set_brightness(percent);
+
+    char line[32];
+    snprintf(line, sizeof(line), "Brightness: %d%%", percent);
+    lv_label_set_text(s_brightness_label, line);
+    s_last_brightness_percent = percent;
+}
+
 static esp_err_t touch_init_internal(void) {
     i2c_master_bus_handle_t bus = get_touch_i2c_bus();
     if (!bus) {
@@ -382,26 +399,26 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     s_status_batt = lv_label_create(s_expanded);
     lv_label_set_text(s_status_batt, "Battery: unavailable");
     lv_obj_set_style_text_color(s_status_batt, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_batt, LV_ALIGN_TOP_LEFT, 0, 34);
+    lv_obj_align(s_status_batt, LV_ALIGN_TOP_LEFT, 0, 162);
 
     s_status_ble = lv_label_create(s_expanded);
     lv_label_set_text(s_status_ble, "BLE HID: init");
     lv_obj_set_style_text_color(s_status_ble, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_ble, LV_ALIGN_TOP_LEFT, 0, 106);
+    lv_obj_align(s_status_ble, LV_ALIGN_TOP_LEFT, 0, 134);
 
     s_status_tailscale = lv_label_create(s_expanded);
     lv_label_set_text(s_status_tailscale, "Tailscale: init");
     lv_obj_set_style_text_color(s_status_tailscale, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_tailscale, LV_ALIGN_TOP_LEFT, 0, 82);
+    lv_obj_align(s_status_tailscale, LV_ALIGN_TOP_LEFT, 0, 110);
 
     s_status_wifi = lv_label_create(s_expanded);
     lv_label_set_text(s_status_wifi, "WiFi: init");
     lv_obj_set_style_text_color(s_status_wifi, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_wifi, LV_ALIGN_TOP_LEFT, 0, 58);
+    lv_obj_align(s_status_wifi, LV_ALIGN_TOP_LEFT, 0, 86);
 
     s_ble_btn_scan = lv_button_create(s_expanded);
     lv_obj_set_size(s_ble_btn_scan, EXPANDED_W - 24, 28);
-    lv_obj_align(s_ble_btn_scan, LV_ALIGN_TOP_LEFT, 0, 132);
+    lv_obj_align(s_ble_btn_scan, LV_ALIGN_TOP_LEFT, 0, 216);
     lv_obj_set_style_bg_color(s_ble_btn_scan, lv_color_hex(0x1F3A5F), 0);
     lv_obj_set_style_bg_opa(s_ble_btn_scan, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_ble_btn_scan, 0, 0);
@@ -413,7 +430,7 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
 
     s_ble_btn_disconnect = lv_button_create(s_expanded);
     lv_obj_set_size(s_ble_btn_disconnect, EXPANDED_W - 24, 28);
-    lv_obj_align(s_ble_btn_disconnect, LV_ALIGN_TOP_LEFT, 0, 132);
+    lv_obj_align(s_ble_btn_disconnect, LV_ALIGN_TOP_LEFT, 0, 216);
     lv_obj_set_style_bg_color(s_ble_btn_disconnect, lv_color_hex(0x1F3A5F), 0);
     lv_obj_set_style_bg_opa(s_ble_btn_disconnect, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_ble_btn_disconnect, 0, 0);
@@ -425,8 +442,8 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     lv_obj_add_flag(s_ble_btn_disconnect, LV_OBJ_FLAG_HIDDEN);
 
     s_ble_list = lv_obj_create(s_expanded);
-    lv_obj_set_size(s_ble_list, EXPANDED_W - 24, SCREEN_H - 168);
-    lv_obj_align(s_ble_list, LV_ALIGN_TOP_LEFT, 0, 164);
+    lv_obj_set_size(s_ble_list, EXPANDED_W - 24, SCREEN_H - 252);
+    lv_obj_align(s_ble_list, LV_ALIGN_TOP_LEFT, 0, 248);
     lv_obj_set_style_pad_all(s_ble_list, 6, 0);
     lv_obj_set_style_pad_row(s_ble_list, 8, 0);
     lv_obj_set_style_radius(s_ble_list, 4, 0);
@@ -441,6 +458,28 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     lv_obj_t *empty = lv_label_create(s_ble_list);
     lv_label_set_text(empty, "No scan results");
     lv_obj_set_style_text_color(empty, lv_color_hex(0x95A5A6), 0);
+
+    if (waveshare_display_brightness_supported()) {
+        s_brightness_label = lv_label_create(s_expanded);
+        lv_obj_set_style_text_color(s_brightness_label, lv_color_hex(0xECF0F1), 0);
+        lv_obj_align(s_brightness_label, LV_ALIGN_TOP_LEFT, 0, 34);
+
+        s_brightness_slider = lv_slider_create(s_expanded);
+        lv_obj_set_size(s_brightness_slider, EXPANDED_W - 40, 18);
+        lv_obj_align(s_brightness_slider, LV_ALIGN_TOP_LEFT, 0, 60);
+        lv_slider_set_range(s_brightness_slider, 5, 100);
+
+        int brightness = waveshare_display_get_brightness();
+        if (brightness < 5) brightness = 5;
+        if (brightness > 100) brightness = 100;
+        lv_slider_set_value(s_brightness_slider, brightness, LV_ANIM_OFF);
+        lv_obj_add_event_cb(s_brightness_slider, brightness_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+        char line[32];
+        snprintf(line, sizeof(line), "Brightness: %d%%", brightness);
+        lv_label_set_text(s_brightness_label, line);
+        s_last_brightness_percent = brightness;
+    }
 
     s_last_update_us = 0;
     lv_obj_add_flag(s_icon_batt, LV_OBJ_FLAG_HIDDEN);
@@ -507,6 +546,18 @@ void ui_status_menu_update(void) {
 
     lv_label_set_text(s_status_batt, "Battery: unavailable");
     lv_obj_set_style_text_color(s_status_batt, batt_color, 0);
+
+    if (s_brightness_slider && s_brightness_label) {
+        int brightness = waveshare_display_get_brightness();
+        if (brightness < 5) brightness = 5;
+        if (brightness > 100) brightness = 100;
+        if (brightness != s_last_brightness_percent) {
+            lv_slider_set_value(s_brightness_slider, brightness, LV_ANIM_OFF);
+            snprintf(line, sizeof(line), "Brightness: %d%%", brightness);
+            lv_label_set_text(s_brightness_label, line);
+            s_last_brightness_percent = brightness;
+        }
+    }
 
     if (ble_paired) {
         lv_obj_add_flag(s_ble_btn_scan, LV_OBJ_FLAG_HIDDEN);

@@ -21,7 +21,7 @@ if(IDF_TARGET STREQUAL "esp32p4")
         "ble_hid_host.cpp"
         "usb_hid_host.cpp"
     )
-    set(extra_requires bt esp_hid usb espressif__usb_host_hid)
+    set(extra_requires bt esp_hid usb espressif__usb_host_hid esp_driver_ledc)
 else()
     list(APPEND srcs
         "waveshare_display.cpp"
