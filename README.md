@@ -25,6 +25,7 @@ Name meaning:
 DumbESPty is a portable, color dumb-terminal style system built for Waveshare 7-inch ESP32 touch display boards, with primary active work on ESP32-P4-WIFI6-Touch-LCD-7B. It combines:
 
 - Wi-Fi station connectivity
+- Tailscale overlay networking (tailnet reachability for SSH targets)
 - BLE HID keyboard input
 - USB OTG HID keyboard input (wired keyboard on onboard OTG port)
 - VT100/xterm-style color terminal emulation rendered via LVGL
@@ -93,6 +94,7 @@ Phase 5 - Linux-like UX Polish
 ## Recent Feature Additions
 
 - Touch status menu with quick access to Wi-Fi and BLE state.
+- Status menu now includes Tailscale connectivity state and display brightness slider control.
 - Wired USB keyboard support over onboard USB OTG host port.
 - Parallel keyboard input path: BLE HID and wired USB HID can be used together.
 - Expanded BLE keyboard management UI:
@@ -109,6 +111,7 @@ Phase 5 - Linux-like UX Polish
   - guard UTF-8 continuation handling so bytes like `0x9B` inside icon glyphs are not misparsed as C1 CSI,
   - retain DSR replies in parser and SSH fast path.
 - Glyph fallback remaps expanded for observed Nerd Font gaps.
+- Default runtime serial logs are quieter in normal operation (CSI trace / RX trace / periodic IO diag disabled unless verbose RX logging is enabled at build time).
 - Private-use icon codepoints (Nerd Font ranges) now bypass Cozette bitmap lookup so Nerd symbols are preferred.
 - Shell usability updates:
   - Bash-like TAB completion behavior (single TAB complete, double TAB list),
@@ -212,6 +215,7 @@ console_base.cpp
   -> shell (local CLI + SSH passthrough)
   -> ssh_client (libssh2 session + recv queue)
   -> wifi_mgr (station management)
+  -> tailscale_mgr (overlay networking + tailnet status)
   -> ble_hid_host (keyboard input)
   -> usb_hid_host (wired keyboard input)
   -> waveshare_display/ch422g (display + control lines)
@@ -222,6 +226,7 @@ Main loop responsibilities:
 - Process BLE queue
 - Process USB HID queue
 - Process Wi-Fi queue
+- Process Tailscale queue
 - Process SSH RX queue
 - Render terminal
 - Run LVGL timer handler

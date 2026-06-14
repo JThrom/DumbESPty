@@ -138,3 +138,16 @@ int waveshare_display_width(void) {
 int waveshare_display_height(void) {
     return H;
 }
+
+bool waveshare_display_brightness_supported(void) {
+    return false;
+}
+
+int waveshare_display_get_brightness(void) {
+    return 100;
+}
+
+esp_err_t waveshare_display_set_brightness(int percent) {
+    (void)percent;
+    return ESP_ERR_NOT_SUPPORTED;
+}

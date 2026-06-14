@@ -37,6 +37,7 @@ static const char *TAG = "SSH_CLIENT";
 #define SSH_HANDSHAKE_RETRIES 3
 #define SSH_VERBOSE_LOGS 0
 #define SSH_USE_RX_TASK 0
+#define SSH_VERBOSE_RX_LOGS 0
 #define SSH_PRIVATE_KEY_MAX_LEN 4096
 #define SSH_KEY_PASSPHRASE_MAX_LEN 128
 
@@ -56,8 +57,11 @@ static uint8_t *ssh_rx_queue_static_storage = NULL;
 static TaskHandle_t ssh_recv_task_handle = NULL;
 static terminal_t *ssh_term = NULL;
 static SemaphoreHandle_t ssh_write_mutex = NULL;
-static int s_rx_trace_budget = 160;
-static int s_rx_preview_budget = 40;
+static constexpr int kRxTraceBudgetDefault = SSH_VERBOSE_RX_LOGS ? 160 : 0;
+static constexpr int kRxPreviewBudgetDefault = SSH_VERBOSE_RX_LOGS ? 40 : 0;
+static constexpr int kRxDiagBudgetDefault = SSH_VERBOSE_RX_LOGS ? 120 : 0;
+static int s_rx_trace_budget = kRxTraceBudgetDefault;
+static int s_rx_preview_budget = kRxPreviewBudgetDefault;
 static uint8_t s_rx_prev_tail = 0;
 static int s_rx_loop_budget = 120;
 static int s_queue_drain_budget = 80;
@@ -70,7 +74,7 @@ static uint32_t s_rx_forwarded_prev = 0;
 static uint32_t s_rx_filtered_prev = 0;
 static uint32_t s_rx_queue_drop_prev = 0;
 static TickType_t s_rx_diag_last_log = 0;
-static int s_rx_diag_budget = 120;
+static int s_rx_diag_budget = kRxDiagBudgetDefault;
 static uint32_t s_tx_total = 0;
 static uint32_t s_tx_prev = 0;
 static bool s_last_connect_requires_password = false;
@@ -2287,8 +2291,8 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     }
 
     ssh_connected = true;
-    s_rx_trace_budget = 160;
-    s_rx_preview_budget = 40;
+    s_rx_trace_budget = kRxTraceBudgetDefault;
+    s_rx_preview_budget = kRxPreviewBudgetDefault;
     s_rx_prev_tail = 0;
     s_rx_loop_budget = 120;
     s_queue_drain_budget = 80;
@@ -2301,7 +2305,7 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     s_rx_filtered_prev = 0;
     s_rx_queue_drop_prev = 0;
     s_rx_diag_last_log = xTaskGetTickCount();
-    s_rx_diag_budget = 120;
+    s_rx_diag_budget = kRxDiagBudgetDefault;
     s_tx_total = 0;
     s_tx_prev = 0;
 
@@ -2352,12 +2356,6 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     coex_release();
 
     ESP_LOGI(TAG, "SSH connected to %s:%d as %s", host, port, user);
-
-    /* Kick interactive prompt on hosts that wait for first line input. */
-    int kick_rc = ssh_write("\r\n", 2);
-    if (kick_rc < 0) {
-        ESP_LOGW(TAG, "Initial prompt kick write failed: %d", kick_rc);
-    }
 
     if (used_no_reply_shell) {
         bool saw_data = false;

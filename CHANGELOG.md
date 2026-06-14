@@ -4,6 +4,21 @@ All notable changes to DumbESPty are documented in this file.
 
 ## [Unreleased]
 
+### Changed (Logging) - 2026-06
+- Reduced default serial monitor noise in normal operation:
+  - terminal CSI trace logging is now disabled by default,
+  - bracketed-paste ON/OFF trace logging is now disabled by default,
+  - SSH RX preview/trace and periodic IO-diag logging are now disabled by default (`SSH_VERBOSE_RX_LOGS=0`).
+
+### Fixed (SSH UX) - 2026-06
+- Removed post-connect synthetic `\r\n` prompt kick in `ssh_connect`, which was creating extra empty shell prompts on successful login.
+
+### Added (UI/Display) - 2026-06
+- Added ESP32-P4 status-menu brightness control slider:
+  - range `5%` to `100%`,
+  - default backlight brightness `25%`,
+  - slider moved to top of expanded status drawer for visibility.
+
 ### Added (Input/USB HID) - 2026-06
 - Added wired keyboard support over onboard USB OTG host port (`main/usb_hid_host.cpp`, `main/usb_hid_host.hpp`).
 - Wired USB HID and BLE HID keyboard input now run in parallel and feed the same shell input path.

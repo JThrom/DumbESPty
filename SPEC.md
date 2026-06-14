@@ -5,6 +5,7 @@
 DumbESPty is a Waveshare 7 inch touch LCD terminal platform powered primarily by ESP32-P4 (legacy path on ESP32-S3). This project is a new take on an old dumb terminal console. It combines a color terminal interface with a simple shell and SSH client so your terminal experience can go with you anywhere.  
 
 - Wi-Fi station connectivity
+- Tailscale overlay networking (tailnet reachability)
 - BLE HID keyboard input
 - USB OTG HID keyboard input (wired)
 - VT100/xterm-style color terminal emulation rendered to LVGL canvas
@@ -56,6 +57,7 @@ console_base.cpp
   -> shell (local CLI + SSH passthrough)
   -> ssh_client (libssh2 session + recv queue)
   -> wifi_mgr (station management)
+  -> tailscale_mgr (overlay networking + tailnet status)
   -> ble_hid_host (keyboard input)
   -> usb_hid_host (wired keyboard input)
   -> waveshare_display/ch422g (display + control lines)
@@ -65,6 +67,7 @@ Main loop responsibilities:
 - process BLE queue
 - process USB HID queue
 - process Wi-Fi queue
+- process Tailscale queue
 - process SSH RX queue
 - render terminal
 - run LVGL timer handler
@@ -124,6 +127,10 @@ Stability hardening:
 - Fast DSR query filter/reply path for `CSI 5n` and `CSI ?5n`
 - Foreground RX pump fallback in main loop when `ssh_recv` task creation fails
 - Optional RX/libssh2 trace logging for terminal compatibility debugging (disabled by default in normal operation)
+- Default runtime monitor output is tuned for daily use:
+  - terminal CSI trace logging is disabled,
+  - bracketed-paste state trace logging is disabled,
+  - SSH RX preview/trace and periodic IO-diag logs are disabled unless `SSH_VERBOSE_RX_LOGS=1`.
 - libssh2/mbedTLS compatibility fixes for ESP-IDF 6.1:
   - corrected cipher direction handling,
   - corrected mbedTLS v3 HMAC setup flow
@@ -191,6 +198,8 @@ Stability hardening:
 - Open gesture is top-right-corner touch zone only
 - Dedicated close button removed (outside-touch dismiss retained)
 - Dark-themed Wi-Fi/BLE controls
+- Includes Tailscale status line and live state color coding
+- Includes backlight brightness slider on ESP32-P4 (`5%` to `100%`, default `25%`)
 - BLE flow:
   - `Scan` shown when unpaired,
   - list rows shown as `Keyboard #`,

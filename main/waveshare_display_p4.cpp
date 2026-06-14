@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/ledc.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -42,6 +43,16 @@ static esp_lcd_dsi_bus_handle_t s_dsi_bus = NULL;
 static esp_lcd_panel_io_handle_t s_dbi_io = NULL;
 static esp_ldo_channel_handle_t s_dsi_ldo = NULL;
 static TaskHandle_t s_bl_task = NULL;
+static bool s_bl_pwm_ready = false;
+static int s_bl_percent = 25;
+static uint32_t s_bl_duty = 0;
+
+static constexpr ledc_mode_t BL_LEDC_MODE = LEDC_LOW_SPEED_MODE;
+static constexpr ledc_channel_t BL_LEDC_CHANNEL = LEDC_CHANNEL_0;
+static constexpr ledc_timer_t BL_LEDC_TIMER = LEDC_TIMER_0;
+static constexpr ledc_timer_bit_t BL_LEDC_DUTY_RES = LEDC_TIMER_10_BIT;
+static constexpr uint32_t BL_LEDC_MAX_DUTY = (1U << BL_LEDC_DUTY_RES) - 1U;
+static constexpr uint32_t BL_LEDC_FREQ_HZ = 20000;
 
 static constexpr uint8_t CH422G_ADDR_MODE = 0x24;
 static constexpr uint8_t CH422G_ADDR_OUT = 0x38;
@@ -62,6 +73,31 @@ static esp_err_t i2c_write_byte(i2c_master_bus_handle_t bus, uint8_t addr, uint8
     ret = i2c_master_transmit(dev, &data, 1, 100);
     i2c_master_bus_rm_device(dev);
     return ret;
+}
+
+static inline int clamp_percent(int percent) {
+    if (percent < 0) return 0;
+    if (percent > 100) return 100;
+    return percent;
+}
+
+static uint32_t percent_to_duty(int percent) {
+    const int p = clamp_percent(percent);
+    return (uint32_t)(((100 - p) * (int)BL_LEDC_MAX_DUTY + 50) / 100);
+}
+
+static void apply_backlight_percent(int percent) {
+    s_bl_percent = clamp_percent(percent);
+    s_bl_duty = percent_to_duty(s_bl_percent);
+
+    if (s_bl_pwm_ready) {
+        ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, s_bl_duty);
+        ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
+        return;
+    }
+
+    const int level = (s_bl_percent > 0) ? LCD_BACKLIGHT_ON_LEVEL : (LCD_BACKLIGHT_ON_LEVEL ? 0 : 1);
+    gpio_set_level(LCD_BACKLIGHT_GPIO, level);
 }
 
 static void try_enable_ch422g_display_power(void) {
@@ -140,8 +176,14 @@ static void try_enable_ch422g_display_power(void) {
 static void backlight_keepalive_task(void *arg) {
     (void)arg;
     while (true) {
-        gpio_set_direction(LCD_BACKLIGHT_GPIO, GPIO_MODE_OUTPUT);
-        gpio_set_level(LCD_BACKLIGHT_GPIO, LCD_BACKLIGHT_ON_LEVEL);
+        if (s_bl_pwm_ready) {
+            ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, s_bl_duty);
+            ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
+        } else {
+            gpio_set_direction(LCD_BACKLIGHT_GPIO, GPIO_MODE_OUTPUT);
+            const int level = (s_bl_percent > 0) ? LCD_BACKLIGHT_ON_LEVEL : (LCD_BACKLIGHT_ON_LEVEL ? 0 : 1);
+            gpio_set_level(LCD_BACKLIGHT_GPIO, level);
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
@@ -283,22 +325,46 @@ static esp_err_t p4_mipi_try_init(lv_display_t **out_disp) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "backlight gpio config failed: %s", esp_err_to_name(ret));
     } else {
-        ret = gpio_set_level(LCD_BACKLIGHT_GPIO, LCD_BACKLIGHT_ON_LEVEL);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "backlight gpio set failed: %s", esp_err_to_name(ret));
+        ledc_timer_config_t timer_cfg = {};
+        timer_cfg.speed_mode = BL_LEDC_MODE;
+        timer_cfg.timer_num = BL_LEDC_TIMER;
+        timer_cfg.duty_resolution = BL_LEDC_DUTY_RES;
+        timer_cfg.freq_hz = BL_LEDC_FREQ_HZ;
+        timer_cfg.clk_cfg = LEDC_AUTO_CLK;
+
+        esp_err_t ledc_ret = ledc_timer_config(&timer_cfg);
+        if (ledc_ret == ESP_OK) {
+            ledc_channel_config_t ch_cfg = {};
+            ch_cfg.gpio_num = LCD_BACKLIGHT_GPIO;
+            ch_cfg.speed_mode = BL_LEDC_MODE;
+            ch_cfg.channel = BL_LEDC_CHANNEL;
+            ch_cfg.intr_type = LEDC_INTR_DISABLE;
+            ch_cfg.timer_sel = BL_LEDC_TIMER;
+            ch_cfg.duty = percent_to_duty(s_bl_percent);
+            ch_cfg.hpoint = 0;
+            ledc_ret = ledc_channel_config(&ch_cfg);
+        }
+
+        if (ledc_ret == ESP_OK) {
+            s_bl_pwm_ready = true;
+            apply_backlight_percent(s_bl_percent);
+            ESP_LOGI(TAG, "backlight PWM enabled on GPIO %d", (int)LCD_BACKLIGHT_GPIO);
         } else {
-            ESP_LOGI(TAG, "backlight enabled on GPIO %d", (int)LCD_BACKLIGHT_GPIO);
-            if (!s_bl_task) {
-                BaseType_t ok = xTaskCreate(backlight_keepalive_task,
-                                            "bl_keepalive",
-                                            2048,
-                                            NULL,
-                                            2,
-                                            &s_bl_task);
-                if (ok != pdPASS) {
-                    ESP_LOGW(TAG, "backlight keepalive task create failed");
-                    s_bl_task = NULL;
-                }
+            s_bl_pwm_ready = false;
+            ESP_LOGW(TAG, "backlight PWM setup failed: %s", esp_err_to_name(ledc_ret));
+            apply_backlight_percent(s_bl_percent);
+        }
+
+        if (!s_bl_task) {
+            BaseType_t ok = xTaskCreate(backlight_keepalive_task,
+                                        "bl_keepalive",
+                                        2048,
+                                        NULL,
+                                        2,
+                                        &s_bl_task);
+            if (ok != pdPASS) {
+                ESP_LOGW(TAG, "backlight keepalive task create failed");
+                s_bl_task = NULL;
             }
         }
     }
@@ -386,4 +452,18 @@ int waveshare_display_width(void) {
 
 int waveshare_display_height(void) {
     return H;
+}
+
+bool waveshare_display_brightness_supported(void) {
+    return true;
+}
+
+int waveshare_display_get_brightness(void) {
+    return s_bl_percent;
+}
+
+esp_err_t waveshare_display_set_brightness(int percent) {
+    s_bl_percent = clamp_percent(percent);
+    apply_backlight_percent(s_bl_percent);
+    return ESP_OK;
 }
