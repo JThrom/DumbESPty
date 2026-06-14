@@ -4,6 +4,17 @@ All notable changes to DumbESPty are documented in this file.
 
 ## [Unreleased]
 
+### Added (Input/USB HID) - 2026-06
+- Added wired keyboard support over onboard USB OTG host port (`main/usb_hid_host.cpp`, `main/usb_hid_host.hpp`).
+- Wired USB HID and BLE HID keyboard input now run in parallel and feed the same shell input path.
+- Added USB HID host initialization and queue processing in `main/console_base.cpp`.
+
+### Changed (Build/Dependencies) - 2026-06
+- Added ESP32-P4 USB host dependencies for wired HID path:
+  - `espressif/usb_host_hid`
+  - `espressif/usb`
+- Pinned `espressif/usb` to `1.1.0` in `main/idf_component.yml` for reproducible ESP-IDF 6.1 compatibility in this project.
+
 ### Added (Shell/Wi-Fi) - 2026-06
 - New `mac` command for station MAC management:
   - `mac` prints current STA MAC address (`XX:XX:XX:XX:XX:XX`).

@@ -6,6 +6,7 @@ DumbESPty is a Waveshare 7 inch touch LCD terminal platform powered primarily by
 
 - Wi-Fi station connectivity
 - BLE HID keyboard input
+- USB OTG HID keyboard input (wired)
 - VT100/xterm-style color terminal emulation rendered to LVGL canvas
 - SSHv2 client transport via libssh2
 
@@ -30,6 +31,8 @@ LazyVim rendering stability.
 - Go-based SSH servers (x/crypto/ssh, wish/charm) are now compatible:
   terminal dimensions are sent inside `pty-req` and no separate
   `window-change` request is issued during session startup.
+- Wired USB keyboard input over onboard OTG host port is supported.
+- BLE and wired USB keyboard inputs can be used in parallel.
 
 ## SSH Compatibility Roadmap (Phased)
 
@@ -54,11 +57,13 @@ console_base.cpp
   -> ssh_client (libssh2 session + recv queue)
   -> wifi_mgr (station management)
   -> ble_hid_host (keyboard input)
+  -> usb_hid_host (wired keyboard input)
   -> waveshare_display/ch422g (display + control lines)
 ```
 
 Main loop responsibilities:
 - process BLE queue
+- process USB HID queue
 - process Wi-Fi queue
 - process SSH RX queue
 - render terminal
@@ -171,6 +176,14 @@ Stability hardening:
   - fallback scan/connect via saved prefix
 - FN-layer ESC compatibility path for keyboards that emit vendor-style short reports (e.g. `00 80 00`)
 - HID usage table corrected to preserve index alignment (including required `0x32` placeholder) so punctuation keys map correctly
+
+### USB HID Host (`main/usb_hid_host.cpp`, `main/usb_hid_host.hpp`)
+
+- Initializes USB Host and USB HID host driver on ESP32-P4
+- Handles wired keyboard connect/disconnect events from OTG host stack
+- Decodes boot keyboard reports and maps keys into shell input stream
+- Reuses control/navigation mappings used by BLE keyboard path
+- Supports concurrent input with BLE keyboard path
 
 ### Status Menu UI (`main/ui_status_menu.cpp`, `main/ui_status_menu.hpp`)
 

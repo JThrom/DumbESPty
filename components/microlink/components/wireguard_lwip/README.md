@@ -1,5 +1,12 @@
 # WireGuard Implementation for lwIP
 
+## Downstream Integration Note (DumbESPty)
+
+In DumbESPty, this WireGuard component is unchanged functionally for the new
+keyboard feature. Wired keyboard support was added in the main application via
+USB OTG HID host (`main/usb_hid_host.cpp`) and operates in parallel with BLE
+keyboard input.
+
 This project is a C implementation of the [WireGuard&reg;](https://www.wireguard.com/) protocol intended to be used with the [lwIP IP stack](https://www.nongnu.org/lwip/)
 
 # Motivation

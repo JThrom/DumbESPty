@@ -47,6 +47,7 @@ Core modules in active use:
 - `main/shell.cpp`, `main/shell.hpp`
 - `main/wifi_mgr.cpp`, `main/wifi_mgr.hpp`
 - `main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`
+- `main/usb_hid_host.cpp`, `main/usb_hid_host.hpp`
 - `main/coex_manager.cpp`, `main/coex_manager_stub.cpp`, `main/coex_manager.hpp`
 - `main/waveshare_display_p4.cpp`, `main/include/waveshare_display.hpp`
 - `main/ch422g_init.cpp`, `main/include/ch422g_init.hpp`
@@ -152,6 +153,11 @@ Build reproducibility warning:
    - Improve default preferences/fallbacks to match Linux-client expectations.
 
 ## Input Compatibility Notes
+
+- Wired keyboard input:
+  - USB HID host over onboard OTG port is active on ESP32-P4 builds.
+  - BLE and wired USB keyboard inputs run in parallel; keep both queue pumps in
+    `main/console_base.cpp` main loop.
 
 - ESC can be keyboard-specific:
   - Some compact keyboards emit `Fn+Esc` via short vendor-style reports

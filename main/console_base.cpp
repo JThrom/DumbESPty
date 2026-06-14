@@ -1,6 +1,7 @@
 #include "ch422g_init.hpp"
 #include "waveshare_display.hpp"
 #include "ble_hid_host.hpp"
+#include "usb_hid_host.hpp"
 #include "shell.hpp"
 #include "ui_status_menu.hpp"
 #include "wifi_mgr.hpp"
@@ -163,6 +164,16 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "BLE HID Host init OK");
     }
 
+    ret = usb_hid_host_init();
+    if (ret == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGI(TAG, "USB HID host unsupported on this target; continuing without wired keyboard");
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "USB HID host init failed: %s", esp_err_to_name(ret));
+        shell_print("\r\n  USB HID Error");
+    } else {
+        ESP_LOGI(TAG, "USB HID Host init OK");
+    }
+
     ret = ui_status_menu_init(lv_scr_act());
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Touch/status menu init failed: %s", esp_err_to_name(ret));
@@ -176,6 +187,7 @@ extern "C" void app_main(void) {
 
     while (1) {
         ble_hid_process_queue();
+        usb_hid_process_queue();
         lv_obj_clear_flag(terminal.canvas, LV_OBJ_FLAG_HIDDEN);
 
         wifi_mgr_process_queue();
