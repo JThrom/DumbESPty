@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <strings.h>
 
 #include "ble_hid_host.hpp"
 #include "ch422g_init.hpp"
@@ -14,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "tailscale_mgr.hpp"
+#include "terminal.hpp"
 #include "waveshare_display.hpp"
 #include "wifi_mgr.hpp"
 
@@ -55,6 +57,9 @@ static lv_obj_t *s_ble_btn_disconnect_label = NULL;
 static lv_obj_t *s_ble_list = NULL;
 static lv_obj_t *s_brightness_label = NULL;
 static lv_obj_t *s_brightness_slider = NULL;
+static lv_obj_t *s_term_color_label = NULL;
+static lv_obj_t *s_term_color_slider = NULL;
+static lv_obj_t *s_term_color_swatch = NULL;
 static bool s_expanded_state = false;
 static int64_t s_last_update_us = 0;
 static int64_t s_last_touch_err_log_us = 0;
@@ -127,6 +132,67 @@ static lv_color_t state_color(bool connected, bool transient) {
     if (connected) return lv_color_hex(0x2ECC71);
     if (transient) return lv_color_hex(0xF1C40F);
     return lv_color_hex(0xE74C3C);
+}
+
+// Maximum number of characters that fit on one line of the status menu.
+static constexpr size_t STATUS_LINE_MAX = 30;
+
+// Clamp a status line to STATUS_LINE_MAX characters in place. If the string is
+// longer it is truncated and the last character is replaced with '.' so the
+// truncation is visible. Operates on bytes; menu status text is ASCII.
+static void clamp_line(char *buf) {
+    if (strlen(buf) <= STATUS_LINE_MAX) return;
+    buf[STATUS_LINE_MAX] = '\0';
+    buf[STATUS_LINE_MAX - 1] = '.';
+}
+
+// Capitalize the first letter of the status value in a "Label: status" line,
+// i.e. the first alphabetic character after the ": " separator. Modifies buf
+// in place. Used for WiFi/Tailscale status lines.
+static void capitalize_status_value(char *buf) {
+    char *sep = strstr(buf, ": ");
+    if (!sep) return;
+    char *value = sep + 2;  // skip ": "
+    if (*value >= 'a' && *value <= 'z') {
+        *value = (char)(*value - ('a' - 'A'));
+    }
+}
+
+// Shorten a BLE device name so it fits in the expanded status menu:
+//   - strip a trailing parenthesized segment (e.g. " (id)")
+//   - abbreviate a leading "Bluetooth" to "BT"
+// Writes into out (always NUL-terminated).
+static void shorten_ble_name(const char *in, char *out, size_t out_len) {
+    if (out_len == 0) return;
+
+    // Copy input, dropping a trailing " (...)" segment.
+    size_t len = strlen(in);
+    const char *paren = strrchr(in, '(');
+    if (paren && len > 0 && in[len - 1] == ')') {
+        len = (size_t)(paren - in);
+        // Trim trailing whitespace before the parenthesis.
+        while (len > 0 && (in[len - 1] == ' ' || in[len - 1] == '\t')) {
+            len--;
+        }
+    }
+
+    // Abbreviate a leading "Bluetooth" to "BT".
+    const char *prefix = "Bluetooth";
+    const size_t prefix_len = 9;  // strlen("Bluetooth")
+    size_t pos = 0;
+    if (len >= prefix_len && strncasecmp(in, prefix, prefix_len) == 0) {
+        if (pos < out_len - 1) out[pos++] = 'B';
+        if (pos < out_len - 1) out[pos++] = 'T';
+        // Skip the original prefix in the source.
+        for (size_t i = prefix_len; i < len && pos < out_len - 1; i++) {
+            out[pos++] = in[i];
+        }
+    } else {
+        for (size_t i = 0; i < len && pos < out_len - 1; i++) {
+            out[pos++] = in[i];
+        }
+    }
+    out[pos] = '\0';
 }
 
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
@@ -235,6 +301,23 @@ static void brightness_slider_event_cb(lv_event_t *e) {
     snprintf(line, sizeof(line), "Brightness: %d%%", percent);
     lv_label_set_text(s_brightness_label, line);
     s_last_brightness_percent = percent;
+}
+
+static void term_color_slider_event_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    if (!s_term_color_slider || !s_term_color_label) return;
+
+    const int index = lv_slider_get_value(s_term_color_slider);
+    terminal_set_default_fg_index(index);
+    terminal_save_default_fg_index(index);
+
+    char line[32];
+    snprintf(line, sizeof(line), "Text color: %d", index);
+    lv_label_set_text(s_term_color_label, line);
+    if (s_term_color_swatch) {
+        lv_obj_set_style_bg_color(s_term_color_swatch,
+                                  lv_color_hex(terminal_color_256_rgb888(index)), 0);
+    }
 }
 
 static esp_err_t touch_init_internal(void) {
@@ -390,31 +473,25 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     lv_obj_clear_flag(s_expanded, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_expanded, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *title = lv_label_create(s_expanded);
-    lv_label_set_text(title, "STATUS");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xECF0F1), 0);
-    lv_obj_set_style_text_font(title, lv_font_get_default(), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
-
     s_status_batt = lv_label_create(s_expanded);
     lv_label_set_text(s_status_batt, "Battery: unavailable");
     lv_obj_set_style_text_color(s_status_batt, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_batt, LV_ALIGN_TOP_LEFT, 0, 162);
+    lv_obj_align(s_status_batt, LV_ALIGN_TOP_LEFT, 0, 200);
 
     s_status_ble = lv_label_create(s_expanded);
     lv_label_set_text(s_status_ble, "BLE HID: init");
     lv_obj_set_style_text_color(s_status_ble, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_ble, LV_ALIGN_TOP_LEFT, 0, 134);
+    lv_obj_align(s_status_ble, LV_ALIGN_TOP_LEFT, 0, 176);
 
     s_status_tailscale = lv_label_create(s_expanded);
     lv_label_set_text(s_status_tailscale, "Tailscale: init");
     lv_obj_set_style_text_color(s_status_tailscale, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_tailscale, LV_ALIGN_TOP_LEFT, 0, 110);
+    lv_obj_align(s_status_tailscale, LV_ALIGN_TOP_LEFT, 0, 152);
 
     s_status_wifi = lv_label_create(s_expanded);
     lv_label_set_text(s_status_wifi, "WiFi: init");
     lv_obj_set_style_text_color(s_status_wifi, lv_color_hex(0xE74C3C), 0);
-    lv_obj_align(s_status_wifi, LV_ALIGN_TOP_LEFT, 0, 86);
+    lv_obj_align(s_status_wifi, LV_ALIGN_TOP_LEFT, 0, 128);
 
     s_ble_btn_scan = lv_button_create(s_expanded);
     lv_obj_set_size(s_ble_btn_scan, EXPANDED_W - 24, 28);
@@ -459,14 +536,45 @@ esp_err_t ui_status_menu_init(lv_obj_t *parent) {
     lv_label_set_text(empty, "No scan results");
     lv_obj_set_style_text_color(empty, lv_color_hex(0x95A5A6), 0);
 
+    // Terminal text color (xterm/ANSI 256-color index 0-255), at the top.
+    {
+        int color_index = terminal_get_default_fg_index();
+
+        s_term_color_label = lv_label_create(s_expanded);
+        lv_obj_set_style_text_color(s_term_color_label, lv_color_hex(0xECF0F1), 0);
+        lv_obj_align(s_term_color_label, LV_ALIGN_TOP_LEFT, 0, 34);
+
+        s_term_color_swatch = lv_obj_create(s_expanded);
+        lv_obj_set_size(s_term_color_swatch, 14, 14);
+        lv_obj_align(s_term_color_swatch, LV_ALIGN_TOP_RIGHT, 0, 34);
+        lv_obj_set_style_radius(s_term_color_swatch, 3, 0);
+        lv_obj_set_style_border_width(s_term_color_swatch, 1, 0);
+        lv_obj_set_style_border_color(s_term_color_swatch, lv_color_hex(0x2C3E50), 0);
+        lv_obj_set_style_pad_all(s_term_color_swatch, 0, 0);
+        lv_obj_clear_flag(s_term_color_swatch, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_color(s_term_color_swatch,
+                                  lv_color_hex(terminal_color_256_rgb888(color_index)), 0);
+
+        s_term_color_slider = lv_slider_create(s_expanded);
+        lv_obj_set_size(s_term_color_slider, (EXPANDED_W - 40), 14);
+        lv_obj_align(s_term_color_slider, LV_ALIGN_TOP_LEFT, 0, 56);
+        lv_slider_set_range(s_term_color_slider, 0, 255);
+        lv_slider_set_value(s_term_color_slider, color_index, LV_ANIM_OFF);
+        lv_obj_add_event_cb(s_term_color_slider, term_color_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+        char line[32];
+        snprintf(line, sizeof(line), "Text color: %d", color_index);
+        lv_label_set_text(s_term_color_label, line);
+    }
+
     if (waveshare_display_brightness_supported()) {
         s_brightness_label = lv_label_create(s_expanded);
         lv_obj_set_style_text_color(s_brightness_label, lv_color_hex(0xECF0F1), 0);
-        lv_obj_align(s_brightness_label, LV_ALIGN_TOP_LEFT, 0, 34);
+        lv_obj_align(s_brightness_label, LV_ALIGN_TOP_LEFT, 0, 78);
 
         s_brightness_slider = lv_slider_create(s_expanded);
-        lv_obj_set_size(s_brightness_slider, EXPANDED_W - 40, 18);
-        lv_obj_align(s_brightness_slider, LV_ALIGN_TOP_LEFT, 0, 60);
+        lv_obj_set_size(s_brightness_slider, (EXPANDED_W - 40), 18);
+        lv_obj_align(s_brightness_slider, LV_ALIGN_TOP_LEFT, 0, 100);
         lv_slider_set_range(s_brightness_slider, 5, 100);
 
         int brightness = waveshare_display_get_brightness();
@@ -519,8 +627,10 @@ void ui_status_menu_update(void) {
     lv_obj_set_style_text_color(s_icon_tailscale, tailscale_color, 0);
 
     char line[128];
+    char ble_name_raw[BLE_HID_NAME_MAX] = {0};
     char ble_name[BLE_HID_NAME_MAX] = {0};
-    ble_hid_get_connected_name(ble_name, sizeof(ble_name));
+    ble_hid_get_connected_name(ble_name_raw, sizeof(ble_name_raw));
+    shorten_ble_name(ble_name_raw, ble_name, sizeof(ble_name));
     if (ble_connected) {
         snprintf(line, sizeof(line), "BLE HID: %s", ble_name[0] ? ble_name : "keyboard");
     } else if (!ble_paired) {
@@ -529,6 +639,7 @@ void ui_status_menu_update(void) {
         snprintf(line, sizeof(line), "BLE HID: %s (%s)", ble_name[0] ? ble_name : "keyboard",
                  ble_scanning ? "scanning" : (ble_connecting ? "connecting" : "disconnected"));
     }
+    clamp_line(line);
     lv_label_set_text(s_status_ble, line);
     lv_obj_set_style_text_color(s_status_ble, ble_color, 0);
 
@@ -537,10 +648,14 @@ void ui_status_menu_update(void) {
     } else {
         snprintf(line, sizeof(line), "WiFi: disconnected");
     }
+    capitalize_status_value(line);
+    clamp_line(line);
     lv_label_set_text(s_status_wifi, line);
     lv_obj_set_style_text_color(s_status_wifi, wifi_color, 0);
 
-    tailscale_mgr_get_status_line(line, sizeof(line));
+    tailscale_mgr_get_status_short(line, sizeof(line));
+    capitalize_status_value(line);
+    clamp_line(line);
     lv_label_set_text(s_status_tailscale, line);
     lv_obj_set_style_text_color(s_status_tailscale, tailscale_color, 0);
 
@@ -554,6 +669,7 @@ void ui_status_menu_update(void) {
         if (brightness != s_last_brightness_percent) {
             lv_slider_set_value(s_brightness_slider, brightness, LV_ANIM_OFF);
             snprintf(line, sizeof(line), "Brightness: %d%%", brightness);
+            clamp_line(line);
             lv_label_set_text(s_brightness_label, line);
             s_last_brightness_percent = brightness;
         }
@@ -608,6 +724,7 @@ void ui_status_menu_update(void) {
                                  results[i].addr[1],
                                  results[i].addr[0]);
                     }
+                    clamp_line(line);
                     lv_label_set_text(txt, line);
                     lv_obj_set_style_text_color(txt, lv_color_hex(0xECF0F1), 0);
                     lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_LEFT, 0);

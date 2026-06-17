@@ -113,6 +113,7 @@ extern "C" void app_main(void) {
     if (cols > TERM_MAX_COLS) cols = TERM_MAX_COLS;
     if (rows > TERM_MAX_ROWS) rows = TERM_MAX_ROWS;
 
+    terminal_load_default_fg_index();
     terminal_init(&terminal,
                   cols,
                   rows,

@@ -1,6 +1,7 @@
 #include "terminal.hpp"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <cstring>
@@ -38,7 +39,16 @@ static constexpr bool kEnableGlyphHalo = false;
 #define RGB565(r, g, b)  ((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3))
 #define RGB565_BLACK     RGB565(0, 0, 0)
 #define RGB565_WHITE     RGB565(255, 255, 255)
-#define RGB565_GREEN     RGB565(0, 255, 0)
+
+// Default terminal foreground color, expressed as an xterm/ANSI 256-color
+// index (0-255). Index 10 is ANSI bright green, the default text color.
+// Configurable at runtime via terminal_set_default_fg_index().
+#define DEFAULT_FG_INDEX_DEFAULT  10
+static int s_default_fg_index = DEFAULT_FG_INDEX_DEFAULT;
+
+// Active terminal instance, captured in terminal_init(), so color changes from
+// the UI can recolor/redraw existing cells without threading a terminal_t*.
+static terminal_t *s_active_term = nullptr;
 
 static const uint16_t ansi_colors[16] = {
     RGB565(0, 0, 0),       RGB565(170, 0, 0),
@@ -136,6 +146,12 @@ static uint16_t color_256(int idx) {
     return rgb_to_565(gray, gray, gray);
 }
 
+// Resolve the configured default foreground color (RGB565) from its 256-color
+// index. Used everywhere the terminal resets to its default text color.
+static uint16_t default_fg(void) {
+    return color_256(s_default_fg_index);
+}
+
 static inline bool is_private_use_codepoint(uint32_t code) {
     return (code >= 0xE000 && code <= 0xF8FF) ||
            (code >= 0xF0000 && code <= 0xFFFFD) ||
@@ -217,7 +233,7 @@ static const term_cell_t *view_cell(const terminal_t *term,
 
 static void reset_cell(term_cell_t *c) {
     c->code = ' ';
-    c->fg = RGB565_GREEN;
+    c->fg = default_fg();
     c->bg = RGB565_BLACK;
     c->bold = c->dim = c->italic = c->underline = 0;
     c->blink = c->reverse = c->conceal = c->strike = 0;
@@ -261,6 +277,7 @@ void terminal_init(terminal_t *term,
         s_term_write_lock = xSemaphoreCreateMutex();
     }
     memset(term, 0, sizeof(*term));
+    s_active_term = term;
     term->bitmap_font = bitmap_font;
     term->font = font;
     term->fallback_font = fallback_font;
@@ -298,7 +315,7 @@ void terminal_init(terminal_t *term,
     term->wraparound = true;
     term->scroll_top = 0;
     term->scroll_bottom = rows - 1;
-    term->cur_fg = RGB565_GREEN;
+    term->cur_fg = default_fg();
     term->cur_bg = RGB565_BLACK;
 
     clear_area(term, 0, 0, rows - 1, cols - 1);
@@ -478,7 +495,7 @@ static int pop_param(terminal_t *term, int idx, int def) {
 
 static void sgr_handler(terminal_t *term) {
     if (term->param_count == 0) {
-        term->cur_fg = RGB565_GREEN;
+        term->cur_fg = default_fg();
         term->cur_bg = RGB565_BLACK;
         term->cur_bold = term->cur_dim = term->cur_italic = 0;
         term->cur_underline = term->cur_blink = 0;
@@ -488,7 +505,7 @@ static void sgr_handler(terminal_t *term) {
     for (int i = 0; i < term->param_count; i++) {
         int p = term->params[i];
         if (p == 0) {
-            term->cur_fg = RGB565_GREEN;
+            term->cur_fg = default_fg();
             term->cur_bg = RGB565_BLACK;
             term->cur_bold = term->cur_dim = term->cur_italic = 0;
             term->cur_underline = term->cur_blink = 0;
@@ -522,7 +539,7 @@ static void sgr_handler(terminal_t *term) {
                 i += 4;
             }
         }
-        else if (p == 39) term->cur_fg = RGB565_GREEN;
+        else if (p == 39) term->cur_fg = default_fg();
         else if (p >= 40 && p <= 47) term->cur_bg = ansi_colors[p - 40];
         else if (p == 48) {
             if (i + 2 < term->param_count && term->params[i + 1] == 5) {
@@ -844,8 +861,20 @@ static void osc_dispatch(terminal_t *term) {
     const char *s = (const char *)term->osc_buf;
 
     if (strncmp(s, "10;?", 4) == 0) {
-        static const char fg_reply[] = "\033]10;rgb:0000/ffff/0000\033\\";
-        term->output_cb(fg_reply, sizeof(fg_reply) - 1);
+        // Report the configured default foreground color. Expand RGB565 to the
+        // 16-bit-per-channel rgb:RRRR/GGGG/BBBB form expected by OSC 10.
+        uint16_t c = default_fg();
+        int r5 = (c >> 11) & 0x1F;
+        int g6 = (c >> 5) & 0x3F;
+        int b5 = c & 0x1F;
+        int r = (r5 * 255 + 15) / 31;
+        int g = (g6 * 255 + 31) / 63;
+        int b = (b5 * 255 + 15) / 31;
+        char fg_reply[40];
+        int n = snprintf(fg_reply, sizeof(fg_reply),
+                         "\033]10;rgb:%02x%02x/%02x%02x/%02x%02x\033\\",
+                         r, r, g, g, b, b);
+        if (n > 0) term->output_cb(fg_reply, (size_t)n);
     } else if (strncmp(s, "11;?", 4) == 0) {
         static const char bg_reply[] = "\033]11;rgb:0000/0000/0000\033\\";
         term->output_cb(bg_reply, sizeof(bg_reply) - 1);
@@ -1382,4 +1411,100 @@ void terminal_scrollback_reset(terminal_t *term) {
 
 bool terminal_scrollback_active(const terminal_t *term) {
     return term && term->view_offset > 0;
+}
+
+// Remap every cell whose fg matches old_fg to new_fg, across the screen, alt,
+// and scrollback buffers, then mark the visible buffer for redraw. This
+// recolors text that was drawn in the default color (prompt, command output)
+// while leaving explicitly-colored text untouched.
+static void recolor_default_fg(terminal_t *term, uint16_t old_fg, uint16_t new_fg) {
+    if (!term || old_fg == new_fg) return;
+
+    bool locked = false;
+    if (s_term_write_lock) {
+        locked = (xSemaphoreTake(s_term_write_lock, pdMS_TO_TICKS(5000)) == pdTRUE);
+    }
+
+    // If the live pen is still on the old default, move it to the new default
+    // so subsequent un-colored output uses the new color too.
+    if (term->cur_fg == old_fg) term->cur_fg = new_fg;
+
+    const int screen_total = term->rows * term->cols;
+    if (term->screen) {
+        for (int i = 0; i < screen_total; i++) {
+            if (term->screen[i].fg == old_fg) { term->screen[i].fg = new_fg; term->screen[i].dirty = 1; }
+        }
+    }
+    if (term->alt) {
+        for (int i = 0; i < screen_total; i++) {
+            if (term->alt[i].fg == old_fg) { term->alt[i].fg = new_fg; term->alt[i].dirty = 1; }
+        }
+    }
+    if (term->scrollback) {
+        const int sb_total = term->scrollback_capacity * term->cols;
+        for (int i = 0; i < sb_total; i++) {
+            if (term->scrollback[i].fg == old_fg) term->scrollback[i].fg = new_fg;
+        }
+    }
+    mark_all_dirty(term);
+
+    if (locked) {
+        xSemaphoreGive(s_term_write_lock);
+    }
+}
+
+void terminal_set_default_fg_index(int index) {
+    if (index < 0) index = 0;
+    if (index > 255) index = 255;
+    if (index == s_default_fg_index) return;
+
+    uint16_t old_fg = default_fg();
+    s_default_fg_index = index;
+    uint16_t new_fg = default_fg();
+
+    recolor_default_fg(s_active_term, old_fg, new_fg);
+}
+
+uint32_t terminal_color_256_rgb888(int index) {
+    if (index < 0) index = 0;
+    if (index > 255) index = 255;
+    uint16_t c = color_256(index);
+    int r5 = (c >> 11) & 0x1F;
+    int g6 = (c >> 5) & 0x3F;
+    int b5 = c & 0x1F;
+    int r = (r5 * 255 + 15) / 31;
+    int g = (g6 * 255 + 31) / 63;
+    int b = (b5 * 255 + 15) / 31;
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+int terminal_get_default_fg_index(void) {
+    return s_default_fg_index;
+}
+
+// NVS persistence for the default-fg color index. Stored as a u8 in the
+// shared "devicecfg" namespace under key "termfg".
+static constexpr char TERM_CFG_NS[] = "devicecfg";
+static constexpr char TERM_FG_KEY[] = "termfg";
+
+void terminal_load_default_fg_index(void) {
+    nvs_handle_t nvs = 0;
+    if (nvs_open(TERM_CFG_NS, NVS_READONLY, &nvs) != ESP_OK) return;
+    uint8_t idx = DEFAULT_FG_INDEX_DEFAULT;
+    if (nvs_get_u8(nvs, TERM_FG_KEY, &idx) == ESP_OK) {
+        terminal_set_default_fg_index(idx);
+    }
+    nvs_close(nvs);
+}
+
+esp_err_t terminal_save_default_fg_index(int index) {
+    if (index < 0) index = 0;
+    if (index > 255) index = 255;
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(TERM_CFG_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(nvs, TERM_FG_KEY, (uint8_t)index);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
 }

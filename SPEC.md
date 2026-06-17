@@ -98,14 +98,24 @@ Compatibility implemented for active editor/shell scenarios:
 - `CSI d` (VPA: vertical position absolute) implemented
 - `CSI > ... q` and `CSI > ... u` variants consumed to reduce compatibility warning noise
 - UTF-8 continuation bytes are consumed before C1 checks in ground state, preventing icon bytes (for example `U+F15B` -> `EF 85 9B`) from being misparsed as CSI
-- OSC 10/11 color queries (`OSC 10;?` / `OSC 11;?`) are answered with the
-  default palette (`rgb:0000/ffff/0000` fg, `rgb:0000/0000/0000` bg);
-  bubbletea/lipgloss TUI apps block at startup waiting for these replies
+- OSC 10/11 color queries (`OSC 10;?` / `OSC 11;?`) are answered; the OSC 10
+  (default foreground) reply reflects the configured default fg color, and
+  OSC 11 reports the background (`rgb:0000/0000/0000`). bubbletea/lipgloss
+  TUI apps block at startup waiting for these replies
 - OSC strings terminated with ST (`ESC \`) are now dispatched (previously
   only BEL/0x9C terminators dispatched, so ST-terminated queries were lost)
 - `terminal_write` is serialized with a mutex (created in `terminal_init`);
   the parser is a stateful byte-stream machine and concurrent writers
   (SSH connect task vs main-loop RX drain) corrupted escape sequences
+- Configurable default foreground color:
+  - stored as an xterm/ANSI 256-color index (default `10`, ANSI bright green),
+    resolved via `color_256()`,
+  - public API: `terminal_set/get/load/save_default_fg_index()` and
+    `terminal_color_256_rgb888()` (`main/terminal.hpp`),
+  - persisted in NVS (`devicecfg`/`termfg`); loaded at boot before
+    `terminal_init`,
+  - changing the index recolors existing cells (screen/alt/scrollback) whose
+    fg matches the previous default, then marks all dirty for redraw
 
 Rendering notes:
 - Uses Cozette bitmap font with LVGL fallback font path
@@ -197,16 +207,29 @@ Stability hardening:
 - Touch-open status drawer with outside-tap dismiss
 - Open gesture is top-right-corner touch zone only
 - Dedicated close button removed (outside-touch dismiss retained)
+- No `STATUS` title in the expanded drawer
 - Dark-themed Wi-Fi/BLE controls
-- Includes Tailscale status line and live state color coding
+- Expanded drawer order (top to bottom): terminal text-color control,
+  brightness control, then Wi-Fi/Tailscale/BLE status lines
+- Terminal text-color control:
+  - slider selects xterm/ANSI 256-color index (`0`-`255`), default `10`,
+  - live color swatch preview,
+  - applies + persists via `terminal_set/save_default_fg_index()`,
+  - recolors/redraws existing default-colored screen text on change
 - Includes backlight brightness slider on ESP32-P4 (`5%` to `100%`, default `25%`)
+- Includes Tailscale status line and live state color coding
+- All status-drawer text lines capped at 30 characters
 - BLE flow:
   - `Scan` shown when unpaired,
   - list rows shown as `Keyboard #`,
   - `Disconnect` shown when paired
-- Wi-Fi label formatting:
+  - connected device names shortened (`Bluetooth` -> `BT`, trailing `(id)` stripped)
+- Wi-Fi label formatting (status value capitalized):
   - connected: `WiFi: <ssid>`
-  - disconnected: `WiFi: disconnected`
+  - disconnected: `WiFi: Disconnected`
+- Tailscale: compact status form in the drawer
+  (`tailscale_mgr_get_status_short()`); shell `tailscale status` keeps the
+  full detailed line
 - Battery status/icon currently hidden in UI (feature code retained)
 
 ### Wi-Fi Manager (`main/wifi_mgr.cpp`)

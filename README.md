@@ -93,6 +93,22 @@ Phase 5 - Linux-like UX Polish
 
 ## Recent Feature Additions
 
+- Configurable default terminal text color:
+  - status-menu slider selects an xterm/ANSI 256-color index (`0`-`255`),
+  - default index `10` (ANSI bright green), with a live color swatch preview,
+  - changing the color recolors and redraws existing on-screen text drawn in
+    the default color, leaving explicitly-colored output untouched,
+  - selection persists across reboots in NVS.
+- Terminal default foreground migrated to the true xterm/ANSI 256-color
+  palette (away from a display-specific pure green).
+- `about` command rebuilt as a modern Neovim/LazyVim-style TUI: rounded box
+  around the ASCII title, Tokyo Night theme, and sectioned device/system/
+  connectivity layout with refreshed information.
+- Expanded status drawer reordered (text color, then brightness, then status
+  lines), with the redundant `STATUS` title removed.
+- Status-drawer text is kept compact: BLE names shortened (`Bluetooth` -> `BT`,
+  trailing `(id)` stripped), Wi-Fi/Tailscale status values capitalized, and all
+  lines capped at 30 characters.
 - Touch status menu with quick access to Wi-Fi and BLE state.
 - Status menu now includes Tailscale connectivity state and display brightness slider control.
 - Wired USB keyboard support over onboard USB OTG host port.
@@ -351,21 +367,32 @@ Known symbol additions for LazyVim compatibility:
 
 ## About Command Reference
 
-The `about` command prints a full-color info screen including:
+The `about` command prints a modern Neovim/LazyVim-style info screen: the
+ASCII title art is framed in a rounded box and styled with the Tokyo Night
+theme (LazyVim default palette), followed by sectioned, left-railed info.
 
+DEVICE section:
 - Product and MCU strings selected by build target (ESP32-P4 vs ESP32-S3)
 - DumbESPty version: runtime app metadata (currently `1.0.0`)
 - Author: `Jason Throm`
 - GitHub: `https://github.com/JThrom/DumbESPty`
 - License: `GNU/GPL v2`
 - Display details: `7-inch panel`, live terminal grid and cell size values
-- Controller helper: `CH422G I2C expander init path enabled`
+- I/O expander: `CH422G (I2C init path enabled)`
+
+SYSTEM section:
 - MCU: target-dependent runtime string (ESP32-P4 or ESP32-S3)
+- Wireless: ESP32-C6 companion (Wi-Fi 6 + BLE 5) on the P4 target
 - ESP-IDF version (runtime)
 - FreeRTOS version (runtime)
 - LVGL version (runtime macro values)
+
+TERMINAL & CONNECTIVITY section:
+- Emulation: VT100/xterm, 256-color with a themable foreground
 - SSH transport: libssh2 version + non-blocking channel mode
-- Input paths: BLE HID host + USB OTG HID host + USB serial console
+- Networking: Wi-Fi station + Tailscale overlay
+- Keyboard: BLE HID + USB OTG HID host
+- Console: USB serial
 
 ## Dependency Versions
 
