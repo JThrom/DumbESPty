@@ -35,6 +35,7 @@ static constexpr bool kEnableGlyphHalo = false;
 #define ST_CSI_INTERMEDIATE  4
 #define ST_OSC               5
 #define ST_ESC_CHARSET       6
+#define ST_DCS               7
 
 #define RGB565(r, g, b)  ((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3))
 #define RGB565_BLACK     RGB565(0, 0, 0)
@@ -131,6 +132,16 @@ static uint16_t halo_color(uint16_t bg, uint16_t fg) {
     if (d >= 0 && d < 56) return RGB565(232, 232, 232);
     if (fl > bl) return RGB565(96, 96, 96);
     return RGB565(216, 216, 216);
+}
+
+/* Linear blend of two RGB565 colors. num/den = weight of fg. */
+static uint16_t blend_565(uint16_t fg, uint16_t bg, int num, int den) {
+    int fr = (fg >> 11) & 0x1F, fgc = (fg >> 5) & 0x3F, fb = fg & 0x1F;
+    int br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;
+    int r = (fr * num + br * (den - num)) / den;
+    int g = (fgc * num + bgc * (den - num)) / den;
+    int b = (fb * num + bb * (den - num)) / den;
+    return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
 static uint16_t color_256(int idx) {
@@ -231,20 +242,28 @@ static const term_cell_t *view_cell(const terminal_t *term,
     return &screen_buf[screen_row * term->cols + col];
 }
 
-static void reset_cell(term_cell_t *c) {
+static void reset_cell_bg(term_cell_t *c, uint16_t bg) {
     c->code = ' ';
     c->fg = default_fg();
-    c->bg = RGB565_BLACK;
+    c->bg = bg;
     c->bold = c->dim = c->italic = c->underline = 0;
     c->blink = c->reverse = c->conceal = c->strike = 0;
     c->dirty = 1;
 }
 
+static void reset_cell(term_cell_t *c) {
+    reset_cell_bg(c, RGB565_BLACK);
+}
+
 static void clear_area(terminal_t *term, int r1, int c1, int r2, int c2) {
+    /* Erase fills with the current SGR background color (xterm behavior), so
+     * apps that clear regions after setting a themed bg (e.g. LazyVim's dark
+     * Normal background) paint that color rather than hardcoded black. */
+    uint16_t bg = term->cur_bg;
     for (int r = r1; r <= r2; r++) {
         for (int c = c1; c <= c2; c++) {
             term_cell_t *cp = cell_ptr(term, r, c);
-            if (cp) reset_cell(cp);
+            if (cp) reset_cell_bg(cp, bg);
         }
     }
 }
@@ -971,6 +990,12 @@ static void parse_char(terminal_t *term, uint8_t c) {
             term->utf8_codepoint = 0;
             term->state = ST_OSC;
             term->osc_len = 0;
+        } else if (c == 0x90) {
+            // 8-bit DCS introducer; consume until ST (see ST_DCS).
+            term->utf8_expected = 0;
+            term->utf8_seen = 0;
+            term->utf8_codepoint = 0;
+            term->state = ST_DCS;
         } else if (c == 0x0E) {
             term->use_g1 = true;
         } else if (c == 0x0F) {
@@ -1014,6 +1039,13 @@ static void parse_char(terminal_t *term, uint8_t c) {
         } else if (c == ']') {
             term->state = ST_OSC;
             term->osc_len = 0;
+        } else if (c == 'P') {
+            // DCS (Device Control String, e.g. XTGETTCAP "DCS + q ... ST").
+            // We do not implement DCS responses; just consume the string up
+            // to its ST terminator so it never leaks as ground text. (A prior
+            // XTGETTCAP state machine caused a LazyVim rendering regression;
+            // silent consumption is the safe behavior.)
+            term->state = ST_DCS;
         } else if (c == '(') {
             term->charset_target = 0;
             term->state = ST_ESC_CHARSET;
@@ -1065,6 +1097,17 @@ static void parse_char(terminal_t *term, uint8_t c) {
         if (term->charset_target == 0) term->g0_dec_special = (c == '0');
         else term->g1_dec_special = (c == '0');
         term->state = ST_GROUND;
+        break;
+
+    case ST_DCS:
+        // Silently consume the DCS payload until its String Terminator.
+        // ST is "ESC \" (7-bit) or 0x9C (8-bit); BEL is accepted leniently.
+        if (c == 0x1B) {
+            term->state = ST_ESC;   // ST_ESC handles '\' -> ST_GROUND
+        } else if (c == 0x9C || c == '\007') {
+            term->state = ST_GROUND;
+        }
+        // else: data byte, ignore.
         break;
 
     case ST_CSI:
@@ -1205,6 +1248,257 @@ static void draw_cell_glyph(const terminal_t *term,
         if (x < 0 || x >= cw || y < 0 || y >= ch) return;
         canvas[y * stride + x] = px;
     };
+
+    /* Block Elements (U+2580-U+259F): render synthetically so they tile the
+     * full cell exactly. The Cozette/LVGL bitmaps are sized for a 6x13 cell
+     * and leave 1px horizontal / 2px vertical gaps inside our 8x15 cell,
+     * which makes solid block art (e.g. opencode splash) look dashed. */
+    if (code >= 0x2580 && code <= 0x259F) {
+        const int x0 = cell_x;
+        const int y0 = cell_y;
+        const int w = term->font_w;
+        const int h = term->font_h;
+        const int xm = x0 + w / 2;       /* vertical mid split */
+        const int ym = y0 + h / 2;       /* horizontal mid split */
+
+        auto fill_rect = [&](int rx0, int ry0, int rx1, int ry1, uint16_t px) {
+            for (int y = ry0; y < ry1; y++)
+                for (int x = rx0; x < rx1; x++)
+                    plot_in_cell(x, y, px);
+        };
+
+        /* Lower n/8 block fills bottom fraction; upper-eighth fills a thin top
+         * band. Eighth boundary rounded to nearest row. */
+        auto eighth_row = [&](int n) { return y0 + ((8 - n) * h + 4) / 8; };
+        auto eighth_col = [&](int n) { return x0 + (n * w + 4) / 8; };
+
+        switch (code) {
+        case 0x2580: fill_rect(x0, y0, x0 + w, ym, fg); break;          /* upper half */
+        case 0x2581: fill_rect(x0, eighth_row(1), x0 + w, y0 + h, fg); break;
+        case 0x2582: fill_rect(x0, eighth_row(2), x0 + w, y0 + h, fg); break;
+        case 0x2583: fill_rect(x0, eighth_row(3), x0 + w, y0 + h, fg); break;
+        case 0x2584: fill_rect(x0, ym, x0 + w, y0 + h, fg); break;      /* lower half */
+        case 0x2585: fill_rect(x0, eighth_row(5), x0 + w, y0 + h, fg); break;
+        case 0x2586: fill_rect(x0, eighth_row(6), x0 + w, y0 + h, fg); break;
+        case 0x2587: fill_rect(x0, eighth_row(7), x0 + w, y0 + h, fg); break;
+        case 0x2588: fill_rect(x0, y0, x0 + w, y0 + h, fg); break;      /* full block */
+        case 0x2589: fill_rect(x0, y0, eighth_col(7), y0 + h, fg); break;
+        case 0x258A: fill_rect(x0, y0, eighth_col(6), y0 + h, fg); break;
+        case 0x258B: fill_rect(x0, y0, eighth_col(5), y0 + h, fg); break;
+        case 0x258C: fill_rect(x0, y0, xm, y0 + h, fg); break;          /* left half */
+        case 0x258D: fill_rect(x0, y0, eighth_col(3), y0 + h, fg); break;
+        case 0x258E: fill_rect(x0, y0, eighth_col(2), y0 + h, fg); break;
+        case 0x258F: fill_rect(x0, y0, eighth_col(1), y0 + h, fg); break;
+        case 0x2590: fill_rect(xm, y0, x0 + w, y0 + h, fg); break;      /* right half */
+        case 0x2591: fill_rect(x0, y0, x0 + w, y0 + h, blend_565(fg, surface_bg, 1, 4)); break; /* light shade */
+        case 0x2592: fill_rect(x0, y0, x0 + w, y0 + h, blend_565(fg, surface_bg, 2, 4)); break; /* medium shade */
+        case 0x2593: fill_rect(x0, y0, x0 + w, y0 + h, blend_565(fg, surface_bg, 3, 4)); break; /* dark shade */
+        case 0x2594: fill_rect(x0, y0, x0 + w, y0 + (h + 4) / 8, fg); break; /* upper 1/8 */
+        case 0x2595: fill_rect(eighth_col(7), y0, x0 + w, y0 + h, fg); break; /* right 1/8 */
+        case 0x2596: fill_rect(x0, ym, xm, y0 + h, fg); break;          /* quadrant lower left */
+        case 0x2597: fill_rect(xm, ym, x0 + w, y0 + h, fg); break;      /* quadrant lower right */
+        case 0x2598: fill_rect(x0, y0, xm, ym, fg); break;             /* quadrant upper left */
+        case 0x2599: fill_rect(x0, y0, xm, ym, fg);                     /* UL+LL+LR */
+                     fill_rect(x0, ym, x0 + w, y0 + h, fg); break;
+        case 0x259A: fill_rect(x0, y0, xm, ym, fg);                     /* UL+LR */
+                     fill_rect(xm, ym, x0 + w, y0 + h, fg); break;
+        case 0x259B: fill_rect(x0, y0, x0 + w, ym, fg);                 /* UL+UR+LL */
+                     fill_rect(x0, ym, xm, y0 + h, fg); break;
+        case 0x259C: fill_rect(x0, y0, x0 + w, ym, fg);                 /* UL+UR+LR */
+                     fill_rect(xm, ym, x0 + w, y0 + h, fg); break;
+        case 0x259D: fill_rect(xm, y0, x0 + w, ym, fg); break;          /* quadrant upper right */
+        case 0x259E: fill_rect(xm, y0, x0 + w, ym, fg);                 /* UR+LL */
+                     fill_rect(x0, ym, xm, y0 + h, fg); break;
+        case 0x259F: fill_rect(xm, y0, x0 + w, ym, fg);                 /* UR+LL+LR */
+                     fill_rect(x0, ym, x0 + w, y0 + h, fg); break;
+        default: break;
+        }
+        return;
+    }
+
+    /* Box Drawing (U+2500-U+257F): render synthetically so lines tile across
+     * cell boundaries. The Cozette bitmaps are 13px tall in a 15px cell, so
+     * vertical runs (e.g. the input-box left border) show 2px gaps and look
+     * dashed. Stems are described per-codepoint as up/right/down/left weights
+     * plus dash count, arc and diagonal flags. Weight: 0=none 1=light
+     * 2=heavy 3=double. */
+    if (code >= 0x2500 && code <= 0x257F) {
+        struct box_def_t {
+            uint8_t up, right, down, left; /* stem weights */
+            uint8_t dash;                  /* 0=solid, else dash segment count */
+            uint8_t arc;                   /* 1=rounded corner */
+            int8_t diag;                   /* 0=none 1='\' 2='/' 3='X' */
+        };
+        /* Table indexed by (code - 0x2500). */
+        static const box_def_t kBox[128] = {
+            /* 2500 ─ */ {0,1,0,1,0,0,0}, /* 2501 ━ */ {0,2,0,2,0,0,0},
+            /* 2502 │ */ {1,0,1,0,0,0,0}, /* 2503 ┃ */ {2,0,2,0,0,0,0},
+            /* 2504 ┄ */ {0,1,0,1,3,0,0}, /* 2505 ┅ */ {0,2,0,2,3,0,0},
+            /* 2506 ┆ */ {1,0,1,0,3,0,0}, /* 2507 ┇ */ {2,0,2,0,3,0,0},
+            /* 2508 ┈ */ {0,1,0,1,4,0,0}, /* 2509 ┉ */ {0,2,0,2,4,0,0},
+            /* 250A ┊ */ {1,0,1,0,4,0,0}, /* 250B ┋ */ {2,0,2,0,4,0,0},
+            /* 250C ┌ */ {0,1,1,0,0,0,0}, /* 250D ┍ */ {0,2,1,0,0,0,0},
+            /* 250E ┎ */ {0,1,2,0,0,0,0}, /* 250F ┏ */ {0,2,2,0,0,0,0},
+            /* 2510 ┐ */ {0,0,1,1,0,0,0}, /* 2511 ┑ */ {0,0,1,2,0,0,0},
+            /* 2512 ┒ */ {0,0,2,1,0,0,0}, /* 2513 ┓ */ {0,0,2,2,0,0,0},
+            /* 2514 └ */ {1,1,0,0,0,0,0}, /* 2515 ┕ */ {1,2,0,0,0,0,0},
+            /* 2516 ┖ */ {2,1,0,0,0,0,0}, /* 2517 ┗ */ {2,2,0,0,0,0,0},
+            /* 2518 ┘ */ {1,0,0,1,0,0,0}, /* 2519 ┙ */ {1,0,0,2,0,0,0},
+            /* 251A ┚ */ {2,0,0,1,0,0,0}, /* 251B ┛ */ {2,0,0,2,0,0,0},
+            /* 251C ├ */ {1,1,1,0,0,0,0}, /* 251D ┝ */ {1,2,1,0,0,0,0},
+            /* 251E ┞ */ {2,1,1,0,0,0,0}, /* 251F ┟ */ {1,1,2,0,0,0,0},
+            /* 2520 ┠ */ {2,1,2,0,0,0,0}, /* 2521 ┡ */ {2,2,1,0,0,0,0},
+            /* 2522 ┢ */ {1,2,2,0,0,0,0}, /* 2523 ┣ */ {2,2,2,0,0,0,0},
+            /* 2524 ┤ */ {1,0,1,1,0,0,0}, /* 2525 ┥ */ {1,0,1,2,0,0,0},
+            /* 2526 ┦ */ {2,0,1,1,0,0,0}, /* 2527 ┧ */ {1,0,2,1,0,0,0},
+            /* 2528 ┨ */ {2,0,2,1,0,0,0}, /* 2529 ┩ */ {2,0,1,2,0,0,0},
+            /* 252A ┪ */ {1,0,2,2,0,0,0}, /* 252B ┫ */ {2,0,2,2,0,0,0},
+            /* 252C ┬ */ {0,1,1,1,0,0,0}, /* 252D ┭ */ {0,1,1,2,0,0,0},
+            /* 252E ┮ */ {0,2,1,1,0,0,0}, /* 252F ┯ */ {0,2,1,2,0,0,0},
+            /* 2530 ┰ */ {0,1,2,1,0,0,0}, /* 2531 ┱ */ {0,1,2,2,0,0,0},
+            /* 2532 ┲ */ {0,2,2,1,0,0,0}, /* 2533 ┳ */ {0,2,2,2,0,0,0},
+            /* 2534 ┴ */ {1,1,0,1,0,0,0}, /* 2535 ┵ */ {1,1,0,2,0,0,0},
+            /* 2536 ┶ */ {1,2,0,1,0,0,0}, /* 2537 ┷ */ {1,2,0,2,0,0,0},
+            /* 2538 ┸ */ {2,1,0,1,0,0,0}, /* 2539 ┹ */ {2,1,0,2,0,0,0},
+            /* 253A ┺ */ {2,2,0,1,0,0,0}, /* 253B ┻ */ {2,2,0,2,0,0,0},
+            /* 253C ┼ */ {1,1,1,1,0,0,0}, /* 253D ┽ */ {1,1,1,2,0,0,0},
+            /* 253E ┾ */ {1,2,1,1,0,0,0}, /* 253F ┿ */ {1,2,1,2,0,0,0},
+            /* 2540 ╀ */ {2,1,1,1,0,0,0}, /* 2541 ╁ */ {1,1,2,1,0,0,0},
+            /* 2542 ╂ */ {2,1,2,1,0,0,0}, /* 2543 ╃ */ {2,1,1,2,0,0,0},
+            /* 2544 ╄ */ {2,2,1,1,0,0,0}, /* 2545 ╅ */ {1,1,2,2,0,0,0},
+            /* 2546 ╆ */ {1,2,2,1,0,0,0}, /* 2547 ╇ */ {2,2,1,2,0,0,0},
+            /* 2548 ╈ */ {1,2,2,2,0,0,0}, /* 2549 ╉ */ {2,1,2,2,0,0,0},
+            /* 254A ╊ */ {2,2,2,1,0,0,0}, /* 254B ╋ */ {2,2,2,2,0,0,0},
+            /* 254C ╌ */ {0,1,0,1,2,0,0}, /* 254D ╍ */ {0,2,0,2,2,0,0},
+            /* 254E ╎ */ {1,0,1,0,2,0,0}, /* 254F ╏ */ {2,0,2,0,2,0,0},
+            /* 2550 ═ */ {0,3,0,3,0,0,0}, /* 2551 ║ */ {3,0,3,0,0,0,0},
+            /* 2552 ╒ */ {0,3,1,0,0,0,0}, /* 2553 ╓ */ {0,1,3,0,0,0,0},
+            /* 2554 ╔ */ {0,3,3,0,0,0,0}, /* 2555 ╕ */ {0,0,1,3,0,0,0},
+            /* 2556 ╖ */ {0,0,3,1,0,0,0}, /* 2557 ╗ */ {0,0,3,3,0,0,0},
+            /* 2558 ╘ */ {1,3,0,0,0,0,0}, /* 2559 ╙ */ {3,1,0,0,0,0,0},
+            /* 255A ╚ */ {3,3,0,0,0,0,0}, /* 255B ╛ */ {1,0,0,3,0,0,0},
+            /* 255C ╜ */ {3,0,0,1,0,0,0}, /* 255D ╝ */ {3,0,0,3,0,0,0},
+            /* 255E ╞ */ {1,3,1,0,0,0,0}, /* 255F ╟ */ {3,1,3,0,0,0,0},
+            /* 2560 ╠ */ {3,3,3,0,0,0,0}, /* 2561 ╡ */ {1,0,1,3,0,0,0},
+            /* 2562 ╢ */ {3,0,3,1,0,0,0}, /* 2563 ╣ */ {3,0,3,3,0,0,0},
+            /* 2564 ╤ */ {0,3,1,3,0,0,0}, /* 2565 ╥ */ {0,1,3,1,0,0,0},
+            /* 2566 ╦ */ {0,3,3,3,0,0,0}, /* 2567 ╧ */ {1,3,0,3,0,0,0},
+            /* 2568 ╨ */ {3,1,0,1,0,0,0}, /* 2569 ╩ */ {3,3,0,3,0,0,0},
+            /* 256A ╪ */ {1,3,1,3,0,0,0}, /* 256B ╫ */ {3,1,3,1,0,0,0},
+            /* 256C ╬ */ {3,3,3,3,0,0,0},
+            /* 256D ╭ */ {0,1,1,0,0,1,0}, /* 256E ╮ */ {0,0,1,1,0,1,0},
+            /* 256F ╯ */ {1,0,0,1,0,1,0}, /* 2570 ╰ */ {1,1,0,0,0,1,0},
+            /* 2571 ╱ */ {0,0,0,0,0,0,2}, /* 2572 ╲ */ {0,0,0,0,0,0,1},
+            /* 2573 ╳ */ {0,0,0,0,0,0,3},
+            /* 2574 ╴ */ {0,0,0,1,0,0,0}, /* 2575 ╵ */ {1,0,0,0,0,0,0},
+            /* 2576 ╶ */ {0,1,0,0,0,0,0}, /* 2577 ╷ */ {0,0,1,0,0,0,0},
+            /* 2578 ╸ */ {0,0,0,2,0,0,0}, /* 2579 ╹ */ {2,0,0,0,0,0,0},
+            /* 257A ╺ */ {0,2,0,0,0,0,0}, /* 257B ╻ */ {0,0,2,0,0,0,0},
+            /* 257C ╼ */ {0,2,0,1,0,0,0}, /* 257D ╽ */ {1,0,2,0,0,0,0},
+            /* 257E ╾ */ {0,1,0,2,0,0,0}, /* 257F ╿ */ {2,0,1,0,0,0,0},
+        };
+
+        const box_def_t d = kBox[code - 0x2500];
+        const int x0 = cell_x, y0 = cell_y;
+        const int w = term->font_w, h = term->font_h;
+        const int xc = x0 + w / 2;     /* center column */
+        const int yc = y0 + h / 2;     /* center row */
+        /* Double-line parallel offset (>=1). */
+        const int dbl = (w >= 8 || h >= 8) ? 2 : 1;
+
+        auto fill_rect = [&](int rx0, int ry0, int rx1, int ry1) {
+            for (int y = ry0; y < ry1; y++)
+                for (int x = rx0; x < rx1; x++)
+                    plot_in_cell(x, y, fg);
+        };
+        /* Vertical span [ry0,ry1) of a stem with given weight at center col. */
+        auto vstem = [&](int ry0, int ry1, int wt) {
+            if (wt == 0) return;
+            if (wt == 3) {                 /* double */
+                fill_rect(xc - dbl, ry0, xc - dbl + 1, ry1);
+                fill_rect(xc + dbl, ry0, xc + dbl + 1, ry1);
+            } else if (wt == 2) {          /* heavy */
+                fill_rect(xc - 1, ry0, xc + 2, ry1);
+            } else {                       /* light */
+                fill_rect(xc, ry0, xc + 1, ry1);
+            }
+        };
+        auto hstem = [&](int rx0, int rx1, int wt) {
+            if (wt == 0) return;
+            if (wt == 3) {
+                fill_rect(rx0, yc - dbl, rx1, yc - dbl + 1);
+                fill_rect(rx0, yc + dbl, rx1, yc + dbl + 1);
+            } else if (wt == 2) {
+                fill_rect(rx0, yc - 1, rx1, yc + 2);
+            } else {
+                fill_rect(rx0, yc, rx1, yc + 1);
+            }
+        };
+
+        /* Diagonals. */
+        if (d.diag) {
+            auto line = [&](int ax, int ay, int bx, int by) {
+                int dx = bx - ax, dy = by - ay;
+                int steps = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy)
+                              ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+                if (steps == 0) { plot_in_cell(ax, ay, fg); return; }
+                for (int s = 0; s <= steps; s++) {
+                    int px = ax + dx * s / steps;
+                    int py = ay + dy * s / steps;
+                    plot_in_cell(px, py, fg);
+                    plot_in_cell(px + 1, py, fg); /* 2px wide for visibility */
+                }
+            };
+            if (d.diag == 1 || d.diag == 3) line(x0, y0, x0 + w - 1, y0 + h - 1);
+            if (d.diag == 2 || d.diag == 3) line(x0 + w - 1, y0, x0, y0 + h - 1);
+            return;
+        }
+
+        /* Rounded corners: draw the two stems to center, plus a small arc
+         * approximation by trimming the inner corner. Falls back to square
+         * stems if cell too small. */
+        if (d.arc) {
+            /* Determine which two directions are present and route stems to a
+             * point near center, joined with a short diagonal for the curve. */
+            if (d.down)  vstem(yc, y0 + h, 1);
+            if (d.up)    vstem(y0, yc + 1, 1);
+            if (d.right) hstem(xc, x0 + w, 1);
+            if (d.left)  hstem(x0, xc + 1, 1);
+            return;
+        }
+
+        /* Dashed lines: split the stem run into segments. */
+        if (d.dash) {
+            int segs = d.dash;
+            if (d.left || d.right) {
+                int wt = d.right ? d.right : d.left;
+                int span = w;
+                int on = (span / segs) - 1; if (on < 1) on = 1;
+                for (int s = 0; s < segs; s++) {
+                    int sx = x0 + s * span / segs;
+                    hstem(sx, sx + on, wt);
+                }
+            }
+            if (d.up || d.down) {
+                int wt = d.down ? d.down : d.up;
+                int span = h;
+                int on = (span / segs) - 1; if (on < 1) on = 1;
+                for (int s = 0; s < segs; s++) {
+                    int sy = y0 + s * span / segs;
+                    vstem(sy, sy + on, wt);
+                }
+            }
+            return;
+        }
+
+        /* Solid stems from center to the relevant edges. Each present stem
+         * extends through the center so junctions connect cleanly. */
+        if (d.up)    vstem(y0, yc + 1, d.up);
+        if (d.down)  vstem(yc, y0 + h, d.down);
+        if (d.left)  hstem(x0, xc + 1, d.left);
+        if (d.right) hstem(xc, x0 + w, d.right);
+        return;
+    }
 
     if (term->bitmap_font && !is_private_use_codepoint(code)) {
         const cozette_bdf_glyph_t *bg = cozette_bdf_lookup(term->bitmap_font, code);
