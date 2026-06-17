@@ -271,7 +271,7 @@ Responsibilities:
 
 - Maintains terminal cell model (codepoint + fg/bg + attributes + dirty bit)
 - Supports normal and alternate screen buffers
-- Parses control stream via state machine (`GROUND`, `ESC`, `CSI`, `CSI_PARAM`, `CSI_INTERMEDIATE`, `OSC`, `ESC_CHARSET`)
+- Parses control stream via state machine (`GROUND`, `ESC`, `CSI`, `CSI_PARAM`, `CSI_INTERMEDIATE`, `OSC`, `ESC_CHARSET`, `DCS`)
 - Renders dirty cells into RGB565 canvas buffer
 
 Implemented compatibility areas:
@@ -289,6 +289,10 @@ Implemented compatibility areas:
 - OSC 10/11 color query replies (default palette) for bubbletea/lipgloss
   TUI startup probing
 - ST-terminated (`ESC \`) OSC dispatch
+- DCS (`ESC P` / `0x90`) strings are silently consumed up to their ST
+  terminator (no XTGETTCAP responses), so capability queries like
+  `DCS + q ... ST` never leak into the visible text (previously corrupted the
+  first LazyVim menu line, e.g. `Find File` rendered as `+q4D73ile`)
 - Thread-safe `terminal_write` (mutex-serialized parser input)
 
 Rendering notes:
@@ -296,6 +300,18 @@ Rendering notes:
 - Cozette bitmap primary + LVGL fallback flow
 - Grid is derived from display resolution using cell `8 x 15`
 - Icon fallback remaps include `U+F426`, `U+E348`, `U+F0B37`, `U+F12B7`, and `U+F1064` to `U+F15B`
+- Block Elements (`U+2580`-`U+259F`) and Box Drawing (`U+2500`-`U+257F`) are
+  rendered synthetically (filled rects / stems) instead of from the font.
+  The Cozette bitmaps are sized for a 6x13 cell, leaving 1px horizontal / 2px
+  vertical gaps inside the 8x15 cell, which made solid block art (e.g. the
+  opencode splash) and vertical box-drawing lines (e.g. input-box borders)
+  look dashed. The synthetic path tiles the full cell so adjacent cells join
+  seamlessly; it covers half/eighth blocks, shades (alpha-blended), quadrants,
+  and light/heavy/double box stems plus dashes, rounded corners, and diagonals.
+- Erase operations (`ED`/`EL`/scroll fills) clear cells using the current SGR
+  background color rather than hardcoded black, so apps that set a themed
+  background then clear regions (e.g. LazyVim's dark Normal background) fill
+  that color to the screen edges instead of leaving black margins.
 
 ### SSH Client (`main/ssh_client.cpp`, `main/ssh_client.hpp`)
 
@@ -468,6 +484,51 @@ ESP32-P4 bring-up note (important):
 - Wired USB keyboard input is independent of BLE pairing state and remains available when OTG keyboard is attached.
 - This behavior is currently expected in the active coexistence model; if keyboard input appears dead after SSH/Wi-Fi events, press any key to prompt reconnect.
 
+## Using DumbESPty Inside tmux (truecolor / COLORTERM)
+
+Running TUIs (LazyVim, opencode, etc.) inside a remote `tmux` session can show
+wrong colors: 24-bit truecolor degrades to the 256-color palette, leaking the
+configured default-green foreground and breaking background/foreground theme
+detection. Launching the same TUI directly over SSH (no tmux) renders correctly.
+
+Why this happens:
+
+- tmux re-emulates the terminal and decides whether to forward 24-bit color
+  based on its own configuration, not on what the device sends per-cell.
+- Popular configs gate truecolor on the `COLORTERM` environment variable.
+  "Oh my tmux" (`gpakosz/.tmux`) does this in its `_apply_24b` routine: it only
+  adds the `Tc` truecolor terminal-override when `COLORTERM` is `truecolor`/
+  `24bit`, or when `tput colors` reports `16777216`.
+- The device advertises `TERM=xterm-256color` (256 colors via terminfo) and an
+  SSH session does not set `COLORTERM` by default, so tmux never enables
+  truecolor and down-samples the palette.
+
+What the device does:
+
+- The SSH client now sends `COLORTERM=truecolor` to the remote via
+  `libssh2_channel_setenv_ex` before the `pty-req`/`shell` requests
+  (`main/ssh_client.cpp`). This is best-effort and non-fatal: many `sshd`
+  configurations restrict which environment variables a client may set
+  (`AcceptEnv`), in which case the request is silently refused.
+
+Making it work on the server (pick one):
+
+1. Allow the variable through sshd, then restart sshd:
+
+   ```sshd_config
+   AcceptEnv COLORTERM
+   ```
+
+2. Export it in a shell startup file that runs before tmux launches
+   (`~/.profile`, `~/.zshenv`, etc.) — works without sshd changes:
+
+   ```sh
+   export COLORTERM=truecolor
+   ```
+
+Either option lets tmux/oh-my-tmux enable truecolor; TUIs then render with the
+correct colors and the correct background/foreground inside tmux windows.
+
 ## Current Priority Bugs
 
 1. Neovim DSR warning
@@ -481,11 +542,16 @@ ESP32-P4 bring-up note (important):
    - Add exact new `U+....` values to symbol font range as observed.
 
 3. DCS parser regression risk
-   - Prior XTGETTCAP DCS state-machine experiment regressed LazyVim rendering and was reverted.
+   - A prior XTGETTCAP DCS state-machine experiment (that generated capability
+     responses) regressed LazyVim rendering and was reverted.
+   - The current `ST_DCS` state only *consumes* DCS strings up to ST and emits
+     no responses; do not extend it to generate XTGETTCAP replies without
+     isolated validation.
 
 ## Regressions to Avoid
 
-- Do not reintroduce DCS parser-state extensions unless isolated and validated.
+- Do not extend the DCS state to generate XTGETTCAP/capability responses
+  without isolated validation; keep it consume-and-ignore.
 - Preserve current known-good LazyVim rendering behavior.
 
 ## Branch and Maintenance Policy

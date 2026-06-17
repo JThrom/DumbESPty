@@ -1124,6 +1124,28 @@ static int ssh_channel_request_pty_with_timeout(LIBSSH2_CHANNEL *ch, const char 
     return LIBSSH2_ERROR_TIMEOUT;
 }
 
+/* Best-effort channel env var. Many servers restrict accepted vars via
+ * sshd AcceptEnv; a refusal returns a non-EAGAIN error and is non-fatal. */
+static int ssh_channel_setenv_with_timeout(LIBSSH2_CHANNEL *ch,
+                                           const char *name,
+                                           const char *value,
+                                           int timeout_ms) {
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int rc = libssh2_channel_setenv_ex(ch,
+                                           name, (unsigned int)strlen(name),
+                                           value, (unsigned int)strlen(value));
+        if (rc == 0) return 0;
+        if (rc == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket(ssh_sock, session);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        return rc;
+    }
+    return LIBSSH2_ERROR_TIMEOUT;
+}
+
 static int ssh_channel_shell_with_timeout(LIBSSH2_CHANNEL *ch, int timeout_ms) {
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     while (xTaskGetTickCount() < deadline) {
@@ -2057,6 +2079,20 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
     ESP_LOGI(TAG, "Channel open OK, requesting PTY...");
 
+    /* Advertise truecolor support to the remote environment. tmux configs
+     * (e.g. oh-my-tmux _apply_24b) gate 24-bit color on $COLORTERM; without
+     * it tmux degrades truecolor SGR to the 256 palette, leaking the wrong
+     * (e.g. default-green) colors and breaking LazyVim bg/fg detection.
+     * Sent before pty/shell; non-fatal if the server's AcceptEnv rejects it. */
+    {
+        int env_rc = ssh_channel_setenv_with_timeout(channel, "COLORTERM", "truecolor", 3000);
+        if (env_rc != 0) {
+            ESP_LOGW(TAG, "setenv COLORTERM failed (non-fatal): %d", env_rc);
+        } else {
+            ESP_LOGI(TAG, "Sent COLORTERM=truecolor to remote");
+        }
+    }
+
     rc = ssh_channel_request_pty_with_timeout(channel, "xterm-256color", SSH_HANDSHAKE_TIMEOUT_MS);
     /* Terminal dimensions are sent inside pty-req; no separate
      * window-change request (Go SSH server compatibility). */
@@ -2327,6 +2363,17 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         libssh2_session_set_blocking(session, 0);
     } else {
         ESP_LOGW(TAG, "Session disappeared before non-blocking restore");
+    }
+
+    /* Clear the local shell clutter now that auth+pty+shell have all
+     * succeeded, BEFORE the recv task starts enqueuing remote output. Doing
+     * the clear here (instead of from the shell worker task after connect)
+     * guarantees it precedes the server's login banner/MOTD (e.g. Armbian
+     * ASCII art) in terminal-write order, so the banner is preserved, and it
+     * only runs on a fully successful connect so the password prompt on a
+     * failed first auth attempt is never wiped. */
+    if (ssh_term) {
+        terminal_write(ssh_term, "\033[2J\033[H", -1);
     }
 
 #if SSH_USE_RX_TASK

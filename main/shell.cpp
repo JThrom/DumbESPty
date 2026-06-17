@@ -1109,7 +1109,12 @@ static void ssh_connect_worker_task(void *param) {
         bool ok = ssh_connect(ctx->host, ctx->port, ctx->user, ctx->pass);
         if (ok) {
             shell_set_ssh_active(true);
-            shell_print("\033[2J\033[H");
+            /* Screen is cleared inside ssh_connect() right after the shell
+             * channel opens and before the remote banner/MOTD is enqueued, so
+             * the clear deterministically precedes the banner (clearing here
+             * from the worker task raced the main-loop RX drain and wiped the
+             * Armbian header) and never clobbers the password prompt on a
+             * failed first auth attempt. */
         } else if (ctx->allow_password_prompt && ssh_last_connect_requires_password()) {
             shell_print("\r\n  Password: ");
             shell_get_hidden_input(ssh_password_cb);
