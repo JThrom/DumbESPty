@@ -4,6 +4,54 @@ All notable changes to DumbESPty are documented in this file.
 
 ## [Unreleased]
 
+### Added (Terminal/Theming) - 2026-06
+- Configurable default terminal text color:
+  - new status-menu slider selects an xterm/ANSI 256-color index (`0`-`255`),
+  - default is index `10` (ANSI bright green),
+  - a live color swatch in the menu previews the selected color,
+  - changing the color immediately recolors and redraws existing on-screen
+    text (prompt + prior output) that was drawn in the default color, while
+    leaving explicitly-colored output untouched,
+  - the selection persists across reboots in NVS (`devicecfg`/`termfg`),
+  - the OSC 10 (default-foreground query) reply now reports the configured
+    color so TUI apps stay consistent.
+- New terminal color API in `main/terminal.hpp`:
+  - `terminal_set_default_fg_index()` / `terminal_get_default_fg_index()`,
+  - `terminal_load_default_fg_index()` / `terminal_save_default_fg_index()` (NVS),
+  - `terminal_color_256_rgb888()` for UI preview.
+
+### Changed (Terminal/Color) - 2026-06
+- Migrated the terminal default foreground from a custom pure-green
+  (`RGB565(0,255,0)`, tuned for a previous display) to the true xterm/ANSI
+  256-color palette (default index `10`, ANSI bright green).
+
+### Changed (About Screen) - 2026-06
+- Rebuilt the `about` command as a modern Neovim/LazyVim-style TUI:
+  - ASCII title art retained, now inside a rounded box frame,
+  - Tokyo Night theme (LazyVim default palette) via truecolor SGR,
+  - sectioned layout (DEVICE / SYSTEM / TERMINAL & CONNECTIVITY) with a
+    left rail and aligned label columns.
+- Updated/refreshed `about` information:
+  - input paths now list `BLE HID + USB OTG HID host` (USB OTG HID host was
+    previously omitted) with a separate USB serial console row,
+  - added Wi-Fi station + Tailscale overlay networking,
+  - added ESP32-C6 Wi-Fi 6 + BLE 5 companion line on the P4 target,
+  - terminal emulation row notes 256-color + themable foreground.
+
+### Changed (Status Menu) - 2026-06
+- Expanded status-drawer layout reordered: text-color control at top,
+  brightness directly below it, then Wi-Fi/Tailscale/BLE status lines.
+- Removed the redundant `STATUS` title from the expanded drawer.
+- BLE HID device names are shortened to fit the drawer:
+  - a trailing parenthesized segment (e.g. ` (id)`) is stripped,
+  - a leading `Bluetooth` is abbreviated to `BT`.
+- Wi-Fi and Tailscale status values are now capitalized
+  (e.g. `disconnected` -> `Disconnected`).
+- All status-drawer text lines are capped at 30 characters to prevent
+  overflow; Tailscale gained a compact menu status form
+  (`tailscale_mgr_get_status_short()`) while the shell `tailscale status`
+  command keeps the full detailed line.
+
 ### Changed (Logging) - 2026-06
 - Reduced default serial monitor noise in normal operation:
   - terminal CSI trace logging is now disabled by default,

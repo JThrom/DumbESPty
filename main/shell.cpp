@@ -752,75 +752,121 @@ static void cmd_clear_handler(int argc, char **argv) {
     clear_screen_and_prompt();
 }
 
+// Tokyo Night theme (the LazyVim default), as SGR truecolor escapes.
+#define TN_RESET   "\033[0m"
+#define TN_FG      "\033[38;2;192;202;245m"   // #c0caf5 foreground
+#define TN_MUTED   "\033[38;2;86;95;137m"     // #565f89 comments/muted
+#define TN_BLUE    "\033[38;2;122;162;247m"   // #7aa2f7
+#define TN_CYAN    "\033[38;2;125;207;255m"   // #7dcfff
+#define TN_GREEN   "\033[38;2;158;206;106m"   // #9ece6a
+#define TN_PURPLE  "\033[38;2;187;154;247m"   // #bb9af7
+#define TN_ORANGE  "\033[38;2;224;175;104m"   // #e0af68
+#define TN_RED     "\033[38;2;247;118;142m"   // #f7768e
+#define TN_DARK    "\033[38;2;65;72;104m"     // #414868 borders
+
+// Box-drawing helpers (UTF-8). Box is 92 columns wide inside the borders.
+#define TN_BAR     "\xe2\x96\x8c"             // '▌' section accent bar
+
+static void about_row(const char *color, const char *label, const char *value) {
+    char line[256];
+    snprintf(line, sizeof(line),
+             "\r\n  " TN_DARK "\xe2\x94\x82" TN_RESET "  %s\xe2\x80\xba" TN_RESET
+             " %s%-18s" TN_RESET TN_FG "%s" TN_RESET,
+             color, color, label, value);
+    shell_print(line);
+}
+
+static void about_section(const char *color, const char *title) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "\r\n  " TN_DARK "\xe2\x94\x82" TN_RESET "\r\n  " TN_DARK "\xe2\x94\x82" TN_RESET
+             "  %s" TN_BAR " %s" TN_RESET,
+             color, title);
+    shell_print(line);
+}
+
 static void cmd_about_handler(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+
     shell_print("\033[2J\033[H");
 
-    shell_print("\r\n\033[48;2;10;12;28m\033[38;2;255;170;95m");
-    shell_print("  8888888b.                         888      8888888888 .d8888b.  8888888b.  888");
-    shell_print("\r\n  888  \"Y88b                        888      888       d88P  Y88b 888   Y88b 888");
-    shell_print("\r\n  888    888                        888      888       Y88b.      888    888 888");
-    shell_print("\r\n  888    888 888  888 88888b.d88b.  88888b.  8888888    \"Y888b.   888   d88P 888888 888  888");
-    shell_print("\r\n  888    888 888  888 888 \"888 \"88b 888 \"88b 888           \"Y88b. 8888888P\"  888    888  888");
-    shell_print("\r\n  888    888 888  888 888  888  888 888  888 888             \"888 888        888    888  888");
-    shell_print("\r\n  888  .d88P Y88b 888 888  888  888 888 d88P 888       Y88b  d88P 888        Y88b.  Y88b 888");
-    shell_print("\r\n  8888888P\"   \"Y88888 888  888  888 88888P\"  8888888888 \"Y8888P\"  888         \"Y888  \"Y88888");
-    shell_print("\r\n                                                                                         888");
-    shell_print("\r\n                                                                                    Y8b d88P");
-    shell_print("\r\n                                                                                     \"Y88P\"\033[0m");
+    // Title block: ASCII art inside a rounded Tokyo Night frame.
+    shell_print("\r\n  " TN_DARK
+        "\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae" TN_RESET);
 
-    shell_print("\r\n\033[48;2;30;20;44m\033[38;2;255;212;120m  DEVICE\033[0m");
-    const esp_app_desc_t *app_desc = esp_app_get_description();
+    shell_print("\r\n  " TN_ORANGE "8888888b.                         888      8888888888 .d8888b.  8888888b.  888");
+    shell_print("\r\n  " "888  \"Y88b                        888      888       d88P  Y88b 888   Y88b 888");
+    shell_print("\r\n  " "888    888                        888      888       Y88b.      888    888 888");
+    shell_print("\r\n  " "888    888 888  888 88888b.d88b.  88888b.  8888888    \"Y888b.   888   d88P 888888 888  888");
+    shell_print("\r\n  " "888    888 888  888 888 \"888 \"88b 888 \"88b 888           \"Y88b. 8888888P\"  888    888  888");
+    shell_print("\r\n  " "888    888 888  888 888  888  888 888  888 888             \"888 888        888    888  888");
+    shell_print("\r\n  " "888  .d88P Y88b 888 888  888  888 888 d88P 888       Y88b  d88P 888        Y88b.  Y88b 888");
+    shell_print("\r\n  " "8888888P\"   \"Y88888 888  888  888 88888P\"  8888888888 \"Y8888P\"  888         \"Y888  \"Y88888");
+    shell_print("\r\n  " "                                                                                       888");
+    shell_print("\r\n  " "                                                                                  Y8b d88P");
+    shell_print("\r\n  " "                                                                                   \"Y88P\"" TN_RESET);
+
+    shell_print("\r\n  " TN_DARK
+        "\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf" TN_RESET);
+
+    // Tagline.
+    shell_print("\r\n  " TN_MUTED "  a dumb terminal for ESP32 \xe2\x80\xa2 SSH over Wi-Fi + Tailscale" TN_RESET);
+
+    // DEVICE
+    about_section(TN_ORANGE, "DEVICE");
     #if CONFIG_IDF_TARGET_ESP32P4
-    shell_print("\r\n\033[38;2;255;212;120m    Product:\033[0m Waveshare ESP32-P4-WIFI6-Touch-LCD-7B");
+    about_row(TN_ORANGE, "Product", "Waveshare ESP32-P4-WIFI6-Touch-LCD-7B");
     #else
-    shell_print("\r\n\033[38;2;255;212;120m    Product:\033[0m Waveshare ESP32-S3-Touch-LCD-7");
+    about_row(TN_ORANGE, "Product", "Waveshare ESP32-S3-Touch-LCD-7");
     #endif
-    shell_print("\r\n\033[38;2;255;212;120m    DumbESPty version:\033[0m ");
-    shell_print(app_desc->version);
-    shell_print("\r\n\033[38;2;255;212;120m    Author:\033[0m Jason Throm");
-    shell_print("\r\n\033[38;2;255;212;120m    GitHub:\033[0m https://github.com/JThrom/DumbESPty");
-    shell_print("\r\n\033[38;2;255;212;120m    License:\033[0m GNU/GPL v2");
+    about_row(TN_ORANGE, "Version", app_desc->version);
+    about_row(TN_ORANGE, "Author", "Jason Throm");
+    about_row(TN_ORANGE, "GitHub", "https://github.com/JThrom/DumbESPty");
+    about_row(TN_ORANGE, "License", "GNU/GPL v2");
     if (term) {
-        char display_line[128];
-        snprintf(display_line,
-                 sizeof(display_line),
-                 "\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel, terminal grid %d x %d, cell %d x %d",
-                 term->cols,
-                 term->rows,
-                 term->font_w,
-                 term->font_h);
-        shell_print(display_line);
+        char display_val[96];
+        snprintf(display_val, sizeof(display_val),
+                 "7\" RGB panel \xe2\x80\xa2 grid %dx%d \xe2\x80\xa2 cell %dx%d",
+                 term->cols, term->rows, term->font_w, term->font_h);
+        about_row(TN_ORANGE, "Display", display_val);
     } else {
-        shell_print("\r\n\033[38;2;255;212;120m    Display:\033[0m 7-inch RGB panel");
+        about_row(TN_ORANGE, "Display", "7\" RGB panel");
     }
-    shell_print("\r\n\033[38;2;255;212;120m    Controller helper:\033[0m CH422G I2C expander init path enabled");
+    about_row(TN_ORANGE, "I/O expander", "CH422G (I2C init path enabled)");
 
-    shell_print("\r\n\r\n\033[48;2;16;36;72m\033[38;2;130;220;255m  MCU + SDK\033[0m");
+    // SYSTEM
+    about_section(TN_BLUE, "SYSTEM");
     #if CONFIG_IDF_TARGET_ESP32P4
-    shell_print("\r\n\033[38;2;130;220;255m    MCU:\033[0m Espressif ESP32-P4 (dual-core + LP core, Wi-Fi 6 companion + BLE path)");
+    about_row(TN_BLUE, "MCU", "ESP32-P4 (dual RISC-V + LP core)");
+    about_row(TN_BLUE, "Wireless", "ESP32-C6 companion \xe2\x80\xa2 Wi-Fi 6 + BLE 5");
     #else
-    shell_print("\r\n\033[38;2;130;220;255m    MCU:\033[0m Espressif ESP32-S3 (dual-core Xtensa LX7, Wi-Fi + BLE)");
+    about_row(TN_BLUE, "MCU", "ESP32-S3 (dual Xtensa LX7, Wi-Fi + BLE)");
     #endif
-    shell_print("\r\n\033[38;2;130;220;255m    ESP-IDF:\033[0m ");
-    shell_print(esp_get_idf_version());
-    shell_print("\r\n\033[38;2;130;220;255m    FreeRTOS:\033[0m ");
-    shell_print(tskKERNEL_VERSION_NUMBER);
-
-    shell_print("\r\n\r\n\033[48;2;52;24;70m\033[38;2;255;170;230m  GRAPHICS + CONNECTIVITY\033[0m");
-    shell_print("\r\n\033[38;2;255;170;230m    LVGL:\033[0m ");
-    shell_print(LVGL_VERSION_MAJOR == 0 ? "unknown" : "v");
-    if (LVGL_VERSION_MAJOR != 0) {
+    about_row(TN_BLUE, "ESP-IDF", esp_get_idf_version());
+    about_row(TN_BLUE, "FreeRTOS", tskKERNEL_VERSION_NUMBER);
+    {
         char lvgl_ver[32];
-        snprintf(lvgl_ver, sizeof(lvgl_ver), "%d.%d.%d", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
-        shell_print(lvgl_ver);
+        snprintf(lvgl_ver, sizeof(lvgl_ver), "%d.%d.%d",
+                 LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
+        about_row(TN_BLUE, "LVGL", LVGL_VERSION_MAJOR == 0 ? "unknown" : lvgl_ver);
     }
-    shell_print("\r\n\033[38;2;255;170;230m    SSH transport:\033[0m libssh2 ");
-    shell_print(LIBSSH2_VERSION);
-    shell_print(" (non-blocking channel mode)");
-    shell_print("\r\n\033[38;2;255;170;230m    Input paths:\033[0m BLE HID host + USB serial console\033[0m\r\n");
+
+    // TERMINAL + CONNECTIVITY
+    about_section(TN_PURPLE, "TERMINAL & CONNECTIVITY");
+    about_row(TN_PURPLE, "Emulation", "VT100/xterm \xe2\x80\xa2 256-color, themable fg");
+    {
+        char ssh_val[80];
+        snprintf(ssh_val, sizeof(ssh_val), "libssh2 %s (non-blocking)", LIBSSH2_VERSION);
+        about_row(TN_PURPLE, "SSH", ssh_val);
+    }
+    about_row(TN_PURPLE, "Networking", "Wi-Fi station + Tailscale overlay");
+    about_row(TN_PURPLE, "Keyboard", "BLE HID + USB OTG HID host");
+    about_row(TN_PURPLE, "Console", "USB serial");
+
+    shell_print("\r\n  " TN_DARK "\xe2\x94\x82" TN_RESET "\r\n");
 }
 
 static char ssh_host[64];

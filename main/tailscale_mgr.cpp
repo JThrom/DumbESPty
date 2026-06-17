@@ -621,6 +621,26 @@ void tailscale_mgr_get_status_line(char *buf, size_t len) {
              ml_state_name(s_ml_state));
 }
 
+void tailscale_mgr_get_status_short(char *buf, size_t len) {
+    ts_sync_state();
+
+    const char *status;
+    if (!s_cfg.enabled) {
+        status = "disabled";
+    } else if (!wifi_mgr_is_connected()) {
+        status = "no wifi";
+    } else if (s_cfg.backend != TS_BACKEND_SAAS) {
+        status = "unsupported";
+    } else if (s_connected) {
+        status = "connected";
+    } else if (s_connecting) {
+        status = "connecting";
+    } else {
+        status = "disconnected";
+    }
+    snprintf(buf, len, "Tailscale: %s", status);
+}
+
 void cmd_tailscale(int argc, char **argv) {
     if (argc < 2) {
         shell_print("\r\n  usage: tailscale enable|disable|backend [saas|headscale]|set tailnet <name>|set control-url <url>|set authkey|set token|show authkey|show token|ping <hostname|ip>|up|down|status|devices|clear");

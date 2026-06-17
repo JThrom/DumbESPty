@@ -64,6 +64,11 @@ Active font assets:
 - Keep terminal geometry derived from display resolution using cell size `8 x 15`.
   - On current P4 panel (`1024 x 600`), baseline grid is `128 x 40`.
 - Keep Cozette primary + LVGL fallback font flow.
+- Default terminal foreground is now an xterm/ANSI 256-color index (default
+  `10`, ANSI bright green), configurable via the status-menu slider and
+  persisted in NVS (`devicecfg`/`termfg`). The default resolves through
+  `color_256()` in `main/terminal.cpp`; see `terminal_set/get/load/save_default_fg_index`
+  and `terminal_color_256_rgb888` in `main/terminal.hpp`.
 
 ## Recently Resolved (2026-06): terminal.shop / Go SSH server support
 
@@ -197,6 +202,11 @@ Build reproducibility warning:
   writes corrupt escape sequences and drop terminal query replies.
 - Do not remove the OSC 10/11 color-query replies or ST-terminated OSC
   dispatch in `terminal.cpp`; bubbletea/lipgloss TUI servers block on them.
+  The OSC 10 reply now reflects the configured default fg index; keep it in
+  sync with `default_fg()` rather than hardcoding a color again.
+- Do not revert the terminal default foreground to the old custom pure green
+  (`RGB565(0,255,0)`); it was display-specific. Default fg is an xterm/ANSI
+  256-color index (default `10`) routed through `color_256()`.
 
 ## Git and Safety Guidance
 

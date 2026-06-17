@@ -2,6 +2,7 @@
 #define TERMINAL_HPP
 
 #include "lvgl.h"
+#include "esp_err.h"
 #include "fonts/cozette_bdf.h"
 #include <cstdint>
 #include <cstddef>
@@ -108,6 +109,23 @@ void terminal_set_output_cb(terminal_t *term, void (*cb)(const char *, size_t));
 void terminal_scrollback_step(terminal_t *term, int delta_lines);
 void terminal_scrollback_reset(terminal_t *term);
 bool terminal_scrollback_active(const terminal_t *term);
+
+// Default terminal foreground color, as an xterm/ANSI 256-color index (0-255).
+// Setting it changes the color used wherever the terminal resets to its
+// default text color (new cells, SGR reset, SGR 39). Existing already-drawn
+// cells keep their stored color until rewritten. Default index is 10 (ANSI
+// bright green).
+void terminal_set_default_fg_index(int index);
+int terminal_get_default_fg_index(void);
+
+// Load the saved default-fg index from NVS (call once at startup before
+// terminal_init). Falls back to the built-in default if none is stored.
+void terminal_load_default_fg_index(void);
+// Persist the given default-fg index to NVS.
+esp_err_t terminal_save_default_fg_index(int index);
+// Resolve an xterm/ANSI 256-color index (0-255) to a packed 0xRRGGBB value,
+// e.g. for previewing the color in UI. Matches the terminal's own palette.
+uint32_t terminal_color_256_rgb888(int index);
 
 #ifdef __cplusplus
 }
