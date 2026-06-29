@@ -12,6 +12,8 @@
 #include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/inet.h"
+#include "netinet/tcp.h"
 #include "nvs.h"
 #include <cstring>
 #include <cstdio>
@@ -26,6 +28,7 @@
 #include "mbedtls/rsa.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "SSH_CLIENT";
 
@@ -77,6 +80,12 @@ static TickType_t s_rx_diag_last_log = 0;
 static int s_rx_diag_budget = kRxDiagBudgetDefault;
 static uint32_t s_tx_total = 0;
 static uint32_t s_tx_prev = 0;
+// Phase 5: application-level SSH keepalive. libssh2 tracks the configured
+// interval; we drive libssh2_keepalive_send() from the main-loop pump so idle
+// sessions exchange traffic and dead links are detected instead of silently
+// stalling into rc=-4 transport reads.
+static constexpr int kSshKeepaliveIntervalSec = 30;
+static TickType_t s_keepalive_last_send = 0;
 static bool s_last_connect_requires_password = false;
 static char s_last_connect_error[192] = "";
 static const char *s_kbdint_password = NULL;
@@ -145,6 +154,41 @@ static void set_last_connect_error(const char *fmt, ...) {
     va_end(ap);
 }
 
+// Phase 5: human-readable names for the libssh2 transport/runtime return codes
+// that show up in rc<0 disconnect logs, so failures are attributable instead
+// of being bare integers.
+static const char *ssh_transport_rc_str(int rc) {
+    switch (rc) {
+        case LIBSSH2_ERROR_NONE:                   return "none";
+        case LIBSSH2_ERROR_SOCKET_NONE:            return "socket-none";
+        case LIBSSH2_ERROR_BANNER_RECV:            return "banner-recv";
+        case LIBSSH2_ERROR_BANNER_SEND:            return "banner-send";
+        case LIBSSH2_ERROR_INVALID_MAC:            return "invalid-mac";
+        case LIBSSH2_ERROR_KEX_FAILURE:            return "kex-failure";
+        case LIBSSH2_ERROR_ALLOC:                  return "alloc";
+        case LIBSSH2_ERROR_SOCKET_SEND:            return "socket-send";
+        case LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE:   return "key-exchange-failure";
+        case LIBSSH2_ERROR_TIMEOUT:                return "timeout";
+        case LIBSSH2_ERROR_HOSTKEY_INIT:           return "hostkey-init";
+        case LIBSSH2_ERROR_HOSTKEY_SIGN:           return "hostkey-sign";
+        case LIBSSH2_ERROR_DECRYPT:                return "decrypt";
+        case LIBSSH2_ERROR_SOCKET_DISCONNECT:      return "socket-disconnect (transport read/EOF)";
+        case LIBSSH2_ERROR_PROTO:                  return "protocol-error";
+        case LIBSSH2_ERROR_PASSWORD_EXPIRED:       return "password-expired";
+        case LIBSSH2_ERROR_METHOD_NONE:            return "method-none";
+        case LIBSSH2_ERROR_AUTHENTICATION_FAILED:  return "auth-failed";
+        case LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED:   return "publickey-unverified";
+        case LIBSSH2_ERROR_CHANNEL_FAILURE:        return "channel-failure";
+        case LIBSSH2_ERROR_CHANNEL_CLOSED:         return "channel-closed";
+        case LIBSSH2_ERROR_CHANNEL_EOF_SENT:       return "channel-eof-sent";
+        case LIBSSH2_ERROR_BAD_USE:                return "bad-use";
+        case LIBSSH2_ERROR_EAGAIN:                 return "eagain (would-block)";
+        case LIBSSH2_ERROR_BUFFER_TOO_SMALL:       return "buffer-too-small";
+        default: break;
+    }
+    return "unknown";
+}
+
 static size_t filter_and_reply_fast_queries(const char *src, size_t len, char *dst);
 static void log_rx_trace(const char *data, size_t len);
 static void log_ssh_runtime_error_context(const char *where, int rc);
@@ -160,15 +204,25 @@ static bool get_server_hostkey_sha1(LIBSSH2_SESSION *sess,
                                     size_t fp_len,
                                     char *hostkey_type,
                                     size_t hostkey_type_len);
+static bool get_server_hostkey_sha256(LIBSSH2_SESSION *sess,
+                                      char *fp,
+                                      size_t fp_len,
+                                      char *hostkey_type,
+                                      size_t hostkey_type_len);
 static bool verify_or_store_host_fingerprint(const char *host, uint16_t port, LIBSSH2_SESSION *sess);
 static uint32_t fnv1a_32(const char *s);
 static bool make_trust_key(const char *host, uint16_t port, char *out, size_t out_len);
 static bool load_trust_record(const char *trust_key,
                               char *host_port_out,
                               size_t host_port_out_len,
+                              char *type_out,
+                              size_t type_out_len,
                               char *fingerprint_out,
                               size_t fingerprint_out_len);
-static bool save_trust_record(const char *trust_key, const char *host_port, const char *fingerprint);
+static bool save_trust_record(const char *trust_key,
+                              const char *host_port,
+                              const char *type,
+                              const char *fingerprint);
 static bool ensure_default_identity_key_loaded(void);
 
 static bool load_default_identity_key(char *out, size_t out_len) {
@@ -547,15 +601,74 @@ static bool get_server_hostkey_sha1(LIBSSH2_SESSION *sess,
     return true;
 }
 
+// Produces an OpenSSH-style fingerprint string: "SHA256:<base64-no-padding>".
+static bool get_server_hostkey_sha256(LIBSSH2_SESSION *sess,
+                                      char *fp,
+                                      size_t fp_len,
+                                      char *hostkey_type,
+                                      size_t hostkey_type_len) {
+    if (!sess || !fp || fp_len == 0) return false;
+
+    size_t hostkey_len = 0;
+    int hostkey_type_id = 0;
+    const char *hostkey = libssh2_session_hostkey(sess, &hostkey_len, &hostkey_type_id);
+    if (!hostkey || hostkey_len == 0) {
+        return false;
+    }
+
+    if (hostkey_type && hostkey_type_len > 0) {
+        const char *name = "unknown";
+        switch (hostkey_type_id) {
+            case LIBSSH2_HOSTKEY_TYPE_RSA:        name = "ssh-rsa"; break;
+            case LIBSSH2_HOSTKEY_TYPE_DSS:        name = "ssh-dss"; break;
+            case LIBSSH2_HOSTKEY_TYPE_ECDSA_256:  name = "ecdsa-sha2-nistp256"; break;
+            case LIBSSH2_HOSTKEY_TYPE_ECDSA_384:  name = "ecdsa-sha2-nistp384"; break;
+            case LIBSSH2_HOSTKEY_TYPE_ECDSA_521:  name = "ecdsa-sha2-nistp521"; break;
+#ifdef LIBSSH2_HOSTKEY_TYPE_ED25519
+            case LIBSSH2_HOSTKEY_TYPE_ED25519:    name = "ssh-ed25519"; break;
+#endif
+            default: break;
+        }
+        snprintf(hostkey_type, hostkey_type_len, "%s", name);
+    }
+
+    const unsigned char *sha256 = (const unsigned char *)libssh2_hostkey_hash(
+        sess, LIBSSH2_HOSTKEY_HASH_SHA256);
+    if (!sha256) {
+        return false;
+    }
+
+    // base64 of 32 bytes is 44 chars (with padding); strip trailing '='.
+    unsigned char b64[64] = {0};
+    size_t b64_len = 0;
+    if (mbedtls_base64_encode(b64, sizeof(b64), &b64_len, sha256, 32) != 0) {
+        return false;
+    }
+    while (b64_len > 0 && b64[b64_len - 1] == '=') {
+        b64[--b64_len] = '\0';
+    }
+
+    int n = snprintf(fp, fp_len, "SHA256:%s", (const char *)b64);
+    return n > 0 && n < (int)fp_len;
+}
+
 static void log_server_hostkey_fingerprint(LIBSSH2_SESSION *sess) {
     if (!sess) return;
-    char fp[80] = {0};
+    char sha1_fp[80] = {0};
+    char sha256_fp[80] = {0};
     char hostkey_type[32] = {0};
-    if (!get_server_hostkey_sha1(sess, fp, sizeof(fp), hostkey_type, sizeof(hostkey_type))) {
+    bool have_sha1 = get_server_hostkey_sha1(sess, sha1_fp, sizeof(sha1_fp),
+                                             hostkey_type, sizeof(hostkey_type));
+    bool have_sha256 = get_server_hostkey_sha256(sess, sha256_fp, sizeof(sha256_fp),
+                                                 hostkey_type, sizeof(hostkey_type));
+    if (!have_sha1 && !have_sha256) {
         ESP_LOGW(TAG, "Unable to derive server host key fingerprint");
         return;
     }
-    ESP_LOGI(TAG, "Server host key: type=%s sha1=%s", hostkey_type, fp);
+    ESP_LOGI(TAG, "Server host key: type=%s %s sha1=%s",
+             hostkey_type,
+             have_sha256 ? sha256_fp : "SHA256:?",
+             have_sha1 ? sha1_fp : "?");
 }
 
 static uint32_t fnv1a_32(const char *s) {
@@ -579,21 +692,27 @@ static bool make_trust_key(const char *host, uint16_t port, char *out, size_t ou
     return n > 0 && n < (int)out_len;
 }
 
+// Record format (current): "host:port|type|SHA256:base64"
+// Legacy format (pre-Phase4): "host:port|aa:bb:..:.." (colon-hex SHA1, no type).
+// Legacy records load with type_out="" so the caller forces a SHA256 upgrade.
 static bool load_trust_record(const char *trust_key,
                               char *host_port_out,
                               size_t host_port_out_len,
+                              char *type_out,
+                              size_t type_out_len,
                               char *fingerprint_out,
                               size_t fingerprint_out_len) {
     if (!trust_key || !host_port_out || !fingerprint_out) return false;
     host_port_out[0] = '\0';
     fingerprint_out[0] = '\0';
+    if (type_out && type_out_len) type_out[0] = '\0';
 
     nvs_handle_t nvs = 0;
     if (nvs_open(SSH_TRUST_NS, NVS_READONLY, &nvs) != ESP_OK) {
         return false;
     }
 
-    char record[180] = {0};
+    char record[200] = {0};
     size_t record_len = sizeof(record);
     esp_err_t err = nvs_get_str(nvs, trust_key, record, &record_len);
     nvs_close(nvs);
@@ -601,29 +720,54 @@ static bool load_trust_record(const char *trust_key,
         return false;
     }
 
-    const char *sep = strchr(record, '|');
-    if (!sep) {
+    const char *sep1 = strchr(record, '|');
+    if (!sep1) {
         return false;
     }
-
-    size_t host_len = (size_t)(sep - record);
-    size_t fp_len = strnlen(sep + 1, sizeof(record) - host_len - 1);
-    if (host_len == 0 || fp_len == 0 || host_len >= host_port_out_len || fp_len >= fingerprint_out_len) {
+    size_t host_len = (size_t)(sep1 - record);
+    if (host_len == 0 || host_len >= host_port_out_len) {
         return false;
     }
-
     memcpy(host_port_out, record, host_len);
     host_port_out[host_len] = '\0';
-    memcpy(fingerprint_out, sep + 1, fp_len);
+
+    const char *sep2 = strchr(sep1 + 1, '|');
+    if (sep2) {
+        // Current 3-field format: type | fingerprint
+        size_t type_len = (size_t)(sep2 - (sep1 + 1));
+        size_t fp_len = strnlen(sep2 + 1, sizeof(record) - (size_t)((sep2 + 1) - record));
+        if (fp_len == 0 || fp_len >= fingerprint_out_len) {
+            return false;
+        }
+        if (type_out && type_out_len) {
+            if (type_len >= type_out_len) type_len = type_out_len - 1;
+            memcpy(type_out, sep1 + 1, type_len);
+            type_out[type_len] = '\0';
+        }
+        memcpy(fingerprint_out, sep2 + 1, fp_len);
+        fingerprint_out[fp_len] = '\0';
+        return true;
+    }
+
+    // Legacy 2-field format: host:port | sha1-hex. type_out stays "".
+    size_t fp_len = strnlen(sep1 + 1, sizeof(record) - (size_t)((sep1 + 1) - record));
+    if (fp_len == 0 || fp_len >= fingerprint_out_len) {
+        return false;
+    }
+    memcpy(fingerprint_out, sep1 + 1, fp_len);
     fingerprint_out[fp_len] = '\0';
     return true;
 }
 
-static bool save_trust_record(const char *trust_key, const char *host_port, const char *fingerprint) {
+static bool save_trust_record(const char *trust_key,
+                              const char *host_port,
+                              const char *type,
+                              const char *fingerprint) {
     if (!trust_key || !host_port || !fingerprint) return false;
 
-    char record[180] = {0};
-    int n = snprintf(record, sizeof(record), "%s|%s", host_port, fingerprint);
+    char record[200] = {0};
+    int n = snprintf(record, sizeof(record), "%s|%s|%s",
+                     host_port, (type && type[0]) ? type : "unknown", fingerprint);
     if (n <= 0 || n >= (int)sizeof(record)) {
         return false;
     }
@@ -646,8 +790,8 @@ static bool verify_or_store_host_fingerprint(const char *host, uint16_t port, LI
 
     char fp[80] = {0};
     char hostkey_type[32] = {0};
-    if (!get_server_hostkey_sha1(sess, fp, sizeof(fp), hostkey_type, sizeof(hostkey_type))) {
-        ESP_LOGW(TAG, "Host trust check skipped: fingerprint unavailable");
+    if (!get_server_hostkey_sha256(sess, fp, sizeof(fp), hostkey_type, sizeof(hostkey_type))) {
+        ESP_LOGW(TAG, "Host trust check skipped: SHA256 fingerprint unavailable");
         return true;
     }
 
@@ -660,17 +804,20 @@ static bool verify_or_store_host_fingerprint(const char *host, uint16_t port, LI
     snprintf(host_port, sizeof(host_port), "%s:%u", host, (unsigned)port);
 
     char stored_host_port[96] = {0};
+    char stored_type[32] = {0};
     char stored_fp[80] = {0};
     if (!load_trust_record(trust_key,
                            stored_host_port,
                            sizeof(stored_host_port),
+                           stored_type,
+                           sizeof(stored_type),
                            stored_fp,
                            sizeof(stored_fp))) {
-        if (!save_trust_record(trust_key, host_port, fp)) {
+        if (!save_trust_record(trust_key, host_port, hostkey_type, fp)) {
             ESP_LOGW(TAG, "Failed to persist TOFU host fingerprint for %s", host_port);
             return true;
         }
-        ESP_LOGI(TAG, "Host trust TOFU: %s type=%s sha1=%s", host_port, hostkey_type, fp);
+        ESP_LOGI(TAG, "Host trust TOFU: %s type=%s %s", host_port, hostkey_type, fp);
         return true;
     }
 
@@ -684,18 +831,101 @@ static bool verify_or_store_host_fingerprint(const char *host, uint16_t port, LI
         return false;
     }
 
+    // Legacy record (SHA1, no type): cannot compare against SHA256. Upgrade
+    // in place by re-pinning the current key with a SHA256 record (TOFU on
+    // the same connection). This only happens once per previously-seen host.
+    if (stored_type[0] == '\0') {
+        if (save_trust_record(trust_key, host_port, hostkey_type, fp)) {
+            ESP_LOGI(TAG, "Host trust upgraded to SHA256: %s type=%s %s",
+                     host_port, hostkey_type, fp);
+        } else {
+            ESP_LOGW(TAG, "Failed to upgrade legacy host trust record for %s", host_port);
+        }
+        return true;
+    }
+
     if (strcmp(stored_fp, fp) != 0) {
         ESP_LOGE(TAG,
                  "Host key mismatch for %s: expected=%s got=%s",
                  host_port,
                  stored_fp,
                  fp);
-        set_last_connect_error("host key mismatch for %s", host_port);
+        set_last_connect_error(
+            "host key mismatch for %s (run: sshknown trust %s to accept)",
+            host_port, host_port);
         return false;
     }
 
-    ESP_LOGI(TAG, "Host trust verified: %s sha1=%s", host_port, fp);
+    ESP_LOGI(TAG, "Host trust verified: %s %s", host_port, fp);
     return true;
+}
+
+// ---- Phase 4: known-host trust management API ----
+
+int ssh_known_hosts_foreach(ssh_known_host_cb cb, void *ctx) {
+    if (!cb) return 0;
+    nvs_iterator_t it = NULL;
+    esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, SSH_TRUST_NS, NVS_TYPE_STR, &it);
+    int count = 0;
+    while (err == ESP_OK && it != NULL) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        char host_port[96] = {0};
+        char type[32] = {0};
+        char fp[80] = {0};
+        if (load_trust_record(info.key,
+                              host_port, sizeof(host_port),
+                              type, sizeof(type),
+                              fp, sizeof(fp))) {
+            cb(host_port, type[0] ? type : "legacy-sha1", fp, ctx);
+            count++;
+        }
+        err = nvs_entry_next(&it);
+    }
+    if (it) nvs_release_iterator(it);
+    return count;
+}
+
+bool ssh_known_host_remove(const char *host, uint16_t port) {
+    if (!host || !host[0]) return false;
+    char trust_key[16] = {0};
+    if (!make_trust_key(host, port, trust_key, sizeof(trust_key))) {
+        return false;
+    }
+    nvs_handle_t nvs = 0;
+    if (nvs_open(SSH_TRUST_NS, NVS_READWRITE, &nvs) != ESP_OK) {
+        return false;
+    }
+    esp_err_t err = nvs_erase_key(nvs, trust_key);
+    if (err == ESP_OK) {
+        nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
+int ssh_known_hosts_clear(void) {
+    nvs_handle_t nvs = 0;
+    if (nvs_open(SSH_TRUST_NS, NVS_READWRITE, &nvs) != ESP_OK) {
+        return 0;
+    }
+    // Count first (best-effort), then erase the whole namespace.
+    int count = 0;
+    nvs_iterator_t it = NULL;
+    if (nvs_entry_find(NVS_DEFAULT_PART_NAME, SSH_TRUST_NS, NVS_TYPE_STR, &it) == ESP_OK) {
+        while (it != NULL) {
+            count++;
+            if (nvs_entry_next(&it) != ESP_OK) break;
+        }
+        if (it) nvs_release_iterator(it);
+    }
+    esp_err_t err = nvs_erase_all(nvs);
+    if (err == ESP_OK) {
+        nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return (err == ESP_OK) ? count : 0;
 }
 
 static QueueHandle_t create_rx_queue_with_fallback(void) {
@@ -891,12 +1121,14 @@ static void log_ssh_runtime_error_context(const char *where, int rc) {
     int last_errno = session ? libssh2_session_last_errno(session) : 0;
 
     ESP_LOGW(TAG,
-             "%s: rc=%d sock_errno=%d (%s) libssh2_last_errno=%d",
+             "%s: rc=%d (%s) sock_errno=%d (%s) libssh2_last_errno=%d (%s)",
              where,
              rc,
+             ssh_transport_rc_str(rc),
              sock_errno,
              strerror(sock_errno),
-             last_errno);
+             last_errno,
+             ssh_transport_rc_str(last_errno));
 
     if (session) {
         char *errmsg = NULL;
@@ -1799,6 +2031,13 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
 
     int keepalive = 1;
     setsockopt(ssh_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    /* Phase 5: disable Nagle so small interactive writes (keystrokes, query
+     * replies) are not coalesced/delayed; matches typical Linux SSH client
+     * latency behavior. */
+    int nodelay = 1;
+    if (setsockopt(ssh_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
+        ESP_LOGW(TAG, "TCP_NODELAY set failed: errno=%d %s", errno, strerror(errno));
+    }
 
     char banner_probe[96];
     if (!ssh_probe_banner_with_timeout(banner_probe, sizeof(banner_probe), 3000)) {
@@ -1850,16 +2089,23 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
         libssh2_trace(session, 0);
 #endif
 
-        const bool use_conservative_profile = (hs_try == 1);
+        /* Phase 5: graded fallback ladder rather than a hard jump to libssh2
+         * defaults.
+         *   attempt 1 -> conservative profile (CBC-first, sha1-first) known
+         *               stable on ESP/mbedTLS.
+         *   attempt 2 -> broadened modern profile (CTR-first, sha2-first) for
+         *               servers that reject the legacy-leaning set, while
+         *               still pinning hostkey preference.
+         *   attempt 3 -> libssh2 built-in defaults (last resort).
+         * The hostkey preference list is applied on every non-default attempt
+         * so ed25519-only servers keep negotiating across the ladder. */
         bool hostkey_has_ed25519 = false;
         char hostkey_pref[160];
         bool have_hostkey_pref = build_hostkey_method_pref(session,
                                                            hostkey_pref,
                                                            sizeof(hostkey_pref),
                                                            &hostkey_has_ed25519);
-        if (use_conservative_profile) {
-            /* First try a conservative profile that has been stable on ESP.
-             * If handshake still fails, retries fall back to libssh2 defaults. */
+        if (hs_try == 1) {
             libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_CS,
                                         "aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr");
             libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_SC,
@@ -1874,19 +2120,33 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
                 libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, hostkey_pref);
             }
             ESP_LOGI(TAG, "Using conservative SSH method profile (attempt %d)", hs_try);
+        } else if (hs_try == 2) {
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_CS,
+                                        "aes256-ctr,aes192-ctr,aes128-ctr,aes128-cbc");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_SC,
+                                        "aes256-ctr,aes192-ctr,aes128-ctr,aes128-cbc");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_CS,
+                                        "hmac-sha2-256,hmac-sha2-512,hmac-sha1");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_SC,
+                                        "hmac-sha2-256,hmac-sha2-512,hmac-sha1");
+            libssh2_session_method_pref(session, LIBSSH2_METHOD_KEX,
+                                        "ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512");
             if (have_hostkey_pref) {
-                ESP_LOGI(TAG, "Hostkey preference list: %s", hostkey_pref);
+                libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, hostkey_pref);
             }
-            if (!hostkey_has_ed25519) {
-                ESP_LOGW(TAG,
-                         "ssh-ed25519 hostkey algorithm is not available in this client build");
-            }
+            ESP_LOGI(TAG, "Using broadened modern SSH method profile (attempt %d)", hs_try);
         } else {
-            ESP_LOGI(TAG, "Using libssh2 default SSH method profile (attempt %d)", hs_try);
-            if (!hostkey_has_ed25519) {
-                ESP_LOGW(TAG,
-                         "ssh-ed25519 hostkey algorithm is not available in this client build");
+            if (have_hostkey_pref) {
+                libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, hostkey_pref);
             }
+            ESP_LOGI(TAG, "Using libssh2 default SSH method profile (attempt %d)", hs_try);
+        }
+        if (have_hostkey_pref) {
+            ESP_LOGI(TAG, "Hostkey preference list: %s", hostkey_pref);
+        }
+        if (!hostkey_has_ed25519) {
+            ESP_LOGW(TAG,
+                     "ssh-ed25519 hostkey algorithm is not available in this client build");
         }
 
 #if SSH_VERBOSE_LOGS
@@ -2327,6 +2587,13 @@ bool ssh_connect(const char *host, uint16_t port, const char *user, const char *
     }
 
     ssh_connected = true;
+    /* Phase 5: enable application keepalive (no forced server reply so it
+     * never blocks; we just need periodic traffic to keep NAT/idle links
+     * alive and to surface dead peers promptly). */
+    if (session) {
+        libssh2_keepalive_config(session, 0, kSshKeepaliveIntervalSec);
+    }
+    s_keepalive_last_send = xTaskGetTickCount();
     s_rx_trace_budget = kRxTraceBudgetDefault;
     s_rx_preview_budget = kRxPreviewBudgetDefault;
     s_rx_prev_tail = 0;
@@ -2544,6 +2811,22 @@ void ssh_process_queue(void) {
 
     if (ssh_connected && channel && !ssh_recv_task_handle) {
         ssh_pump_rx_once(4);
+    }
+
+    /* Phase 5: drive periodic keepalive. libssh2_keepalive_send reports the
+     * seconds until the next one is due; we just gate on our own interval and
+     * surface send failures as a diagnosable disconnect cause. */
+    if (ssh_connected && session) {
+        TickType_t now = xTaskGetTickCount();
+        if (now - s_keepalive_last_send >= pdMS_TO_TICKS(kSshKeepaliveIntervalSec * 1000)) {
+            int seconds_to_next = 0;
+            int ka_rc = libssh2_keepalive_send(session, &seconds_to_next);
+            s_keepalive_last_send = now;
+            if (ka_rc != 0 && ka_rc != LIBSSH2_ERROR_EAGAIN) {
+                ESP_LOGW(TAG, "Keepalive send failed rc=%d (%s)",
+                         ka_rc, ssh_transport_rc_str(ka_rc));
+            }
+        }
     }
 
     ssh_rx_msg_t msg;

@@ -188,6 +188,17 @@ static int completion_collect_matches(char out[][33], int max_entries, const cha
         return n;
     }
 
+    if (strcmp(cmd, "sshknown") == 0 && context_argc == 1) {
+        static const char *sshknown_subcmds[] = {
+            "list", "remove", "trust", "clear"
+        };
+        for (size_t i = 0; i < sizeof(sshknown_subcmds) / sizeof(sshknown_subcmds[0]) && n < max_entries; i++) {
+            completion_add_item(out, max_entries, &n, sshknown_subcmds[i], prefix);
+        }
+        completion_sort_items(out, n);
+        return n;
+    }
+
     if (strcmp(cmd, "tailscale") == 0) {
         if (context_argc == 1) {
             static const char *tailscale_subcmds[] = {
@@ -1292,6 +1303,99 @@ static void cmd_ssh_handler(int argc, char **argv) {
     queue_ssh_connect("", true);
 }
 
+// Parses "host" or "host:port" for sshknown subcommands. Defaults port to 22.
+static bool parse_host_port(const char *arg, char *host_out, size_t host_cap, uint16_t *port_out) {
+    if (!arg || !arg[0] || !host_out || host_cap == 0 || !port_out) return false;
+    const char *colon = strrchr(arg, ':');
+    if (colon) {
+        size_t host_len = (size_t)(colon - arg);
+        if (host_len == 0 || host_len >= host_cap) return false;
+        const char *port_str = colon + 1;
+        char *end = NULL;
+        long p = strtol(port_str, &end, 10);
+        if (*end != '\0' || p <= 0 || p > 65535) return false;
+        memcpy(host_out, arg, host_len);
+        host_out[host_len] = '\0';
+        *port_out = (uint16_t)p;
+    } else {
+        snprintf(host_out, host_cap, "%s", arg);
+        *port_out = 22;
+    }
+    return true;
+}
+
+static void sshknown_list_cb(const char *host_port,
+                             const char *type,
+                             const char *fingerprint,
+                             void *ctx) {
+    int *n = (int *)ctx;
+    if (n) (*n)++;
+    char line[160];
+    snprintf(line, sizeof(line), "\r\n  %-28s %-22s %s",
+             host_port ? host_port : "?",
+             type ? type : "?",
+             fingerprint ? fingerprint : "?");
+    shell_print(line);
+}
+
+static void cmd_sshknown_handler(int argc, char **argv) {
+    if (argc < 2) {
+        shell_print("\r\n  usage: sshknown list|remove <host[:port]>|trust <host[:port]>|clear");
+        return;
+    }
+
+    if (strcmp(argv[1], "list") == 0) {
+        int n = 0;
+        ssh_known_hosts_foreach(sshknown_list_cb, &n);
+        if (n == 0) {
+            shell_print("\r\n  no known hosts stored");
+        }
+        return;
+    }
+
+    // "remove" and "trust" both delete the pinned record. After removal the
+    // next connection re-pins (TOFU) the server's current key, which is how a
+    // user accepts a legitimately changed host key.
+    if (strcmp(argv[1], "remove") == 0 || strcmp(argv[1], "trust") == 0) {
+        if (argc < 3) {
+            shell_print("\r\n  usage: sshknown remove <host[:port]>");
+            return;
+        }
+        char host[80] = {0};
+        uint16_t port = 22;
+        if (!parse_host_port(argv[2], host, sizeof(host), &port)) {
+            shell_print("\r\n  invalid host[:port]");
+            return;
+        }
+        bool removed = ssh_known_host_remove(host, port);
+        if (removed) {
+            char line[128];
+            if (strcmp(argv[1], "trust") == 0) {
+                snprintf(line, sizeof(line),
+                         "\r\n  trust reset for %s:%u (next connect re-pins key)",
+                         host, (unsigned)port);
+            } else {
+                snprintf(line, sizeof(line), "\r\n  removed known host %s:%u",
+                         host, (unsigned)port);
+            }
+            shell_print(line);
+        } else {
+            shell_print("\r\n  no matching known host record");
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "clear") == 0) {
+        int n = ssh_known_hosts_clear();
+        char line[64];
+        snprintf(line, sizeof(line), "\r\n  cleared %d known host record(s)", n);
+        shell_print(line);
+        return;
+    }
+
+    shell_print("\r\n  usage: sshknown list|remove <host[:port]>|trust <host[:port]>|clear");
+}
+
 static bool parse_mac_string(const char *text, uint8_t mac[6]) {
     if (!text || !mac) return false;
     unsigned int b[6] = {0};
@@ -1366,6 +1470,7 @@ void shell_init(terminal_t *t) {
     shell_register_cmd("wifi", cmd_wifi);
     shell_register_cmd("ssh", cmd_ssh_handler);
     shell_register_cmd("sshkey", cmd_sshkey_handler);
+    shell_register_cmd("sshknown", cmd_sshknown_handler);
     shell_register_cmd("tailscale", cmd_tailscale);
     shell_register_cmd("hostname", cmd_hostname);
     shell_register_cmd("mac", cmd_mac_handler);

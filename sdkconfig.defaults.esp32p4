@@ -42,5 +42,16 @@ CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI=y
 # NimBLE host-only should use Hosted VHCI, not UART pins
 # CONFIG_BT_NIMBLE_TRANSPORT_UART is not set
 
+# Brownout detector: the board has no software power-path management, so when
+# USB is unplugged the onboard charger/power-path switches the system rail from
+# VBUS to the Li-ion battery. That handover causes a brief rail dip. At the
+# stock highest-sensitivity level (SEL_7) the brownout detector trips on that
+# dip and resets the chip even though the battery alone runs the board fine.
+# Lower the threshold so the transient switchover dip is tolerated while still
+# protecting against a genuine sustained undervoltage.
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5=y
+CONFIG_ESP_BROWNOUT_DET_LVL=5
+
 # LVGL
 CONFIG_LV_USE_GIF=y

@@ -35,19 +35,146 @@ LazyVim rendering stability.
 - Wired USB keyboard input over onboard OTG host port is supported.
 - BLE and wired USB keyboard inputs can be used in parallel.
 
-## SSH Compatibility Roadmap (Phased)
+## SSH Authentication & Trust
 
-1. Phase 1: host key compatibility (DONE 2026-06)
-   - Client supports `ssh-ed25519` host keys via libssh2 fork.
-2. Phase 2: auth method coverage
-   - Ensure robust `publickey`, `keyboard-interactive`, `password`, `none`
-     negotiation behavior.
-3. Phase 3: key management
-   - Add vault-backed private-key import/storage and passphrase support.
-4. Phase 4: host trust model
-   - Add `known_hosts`-style fingerprint pinning and mismatch protections.
-5. Phase 5: compatibility polish
-   - Improve defaults/fallbacks and diagnostics to match Linux SSH behavior.
+The SSH client implements Linux-like authentication, key management, and host
+trust. All logic lives in `main/ssh_client.cpp` (transport/auth/trust) and
+`main/shell.cpp` (`ssh`, `sshkey`, `sshknown` commands), with encrypted key
+storage in `main/secret_vault.cpp`.
+
+### Connecting
+
+```
+ssh [user@]host[:port]
+```
+
+- Default user is `root` if `user@` is omitted; default port is `22`.
+- The user/host/port parser lives in `cmd_ssh_handler` (`main/shell.cpp`).
+
+### Host key algorithms
+
+- Supported server host key types: `ssh-ed25519`, ECDSA
+  (nistp256/384/521), and RSA.
+- `ssh-ed25519` is provided by the forked libssh2 (`../../libssh2_esp`,
+  `override_path` in `main/idf_component.yml`) using vendored ref10 ed25519
+  verification in the mbedTLS backend. This makes ed25519-only servers (e.g.
+  `terminal.shop`) work end-to-end.
+- The host key preference list is built dynamically from the algorithms the
+  client build actually supports, ordered `ssh-ed25519` -> ECDSA -> RSA, and
+  is applied on every handshake attempt so ed25519-only servers always have an
+  overlap (`build_hostkey_method_pref`).
+
+### Authentication methods
+
+The client probes and negotiates the following methods, in this order
+(`ssh_connect` auth block in `main/ssh_client.cpp`):
+
+1. `none` - probed first; if the server grants access with no credentials the
+   session proceeds immediately (`ssh_get_auth_methods_with_timeout` reports
+   `none` success).
+2. `publickey` - used when the server offers it and a private key is loaded.
+   The key is taken from the runtime slot (see Key management). On failure the
+   client falls back to password/keyboard-interactive if the server offers
+   them and a password is available.
+   (`ssh_userauth_publickey_with_timeout`,
+   `libssh2_userauth_publickey_frommemory`)
+3. `keyboard-interactive` - prompt-driven; the configured password answers the
+   server's prompts via the `ssh_kbdint_cb` callback.
+   (`ssh_userauth_kbdint_with_timeout`)
+4. `password` - plain password auth.
+   (`ssh_userauth_with_timeout`, `libssh2_userauth_password`)
+
+Behavior details:
+- The server's offered method list is queried up front
+  (`libssh2_userauth_list`) and drives which path is taken.
+- If the server requires `publickey` and no key is loaded, the connect fails
+  with a clear message: `server requires publickey auth; load key with
+  sshkey load/import`.
+- If the server requires a password and none was provided, the connect
+  signals `requires password` so the shell can prompt for one
+  (`ssh_last_connect_requires_password`).
+- Passwords are captured on demand via a hidden-input shell callback and are
+  not stored persistently.
+
+### Key management (`sshkey` command)
+
+Private keys are stored encrypted in NVS via the secret vault
+(`main/secret_vault.cpp`): AES-encrypted blob, key derived from a
+user-supplied vault password, with rekey support (`vault` command).
+
+```
+sshkey status   - show runtime key (loaded?) and vault key (present?)
+sshkey import   - prompt for vault password, paste PEM private key, optional
+                  key passphrase; encrypts and stores the key in the vault
+sshkey load     - prompt for vault password; decrypts and loads the key into
+                  the runtime slot for use during connect
+sshkey clear    - wipe the runtime key from RAM (vault copy retained)
+sshkey erase    - wipe the runtime key AND remove it from the vault
+```
+
+- Imported PEM keys are validated for a `-----BEGIN` header.
+- Passphrase-protected keys are supported (passphrase stored in the vault
+  alongside the key, used at `publickey` auth time).
+- Runtime key API: `ssh_set_private_key_pem`, `ssh_clear_private_key`,
+  `ssh_has_private_key` (`main/ssh_client.hpp`).
+
+### Host trust (`sshknown` command)
+
+TOFU (trust-on-first-use) host key pinning, keyed by `host:port`, stored in
+NVS namespace `sshtrust`:
+
+- On first connect to a host the SHA256 (OpenSSH-style `SHA256:base64`)
+  fingerprint and key type are pinned (`verify_or_store_host_fingerprint`).
+- On reconnect the fingerprint must match; a mismatch hard-fails the connect
+  with `host key mismatch` and instructions to accept the new key.
+- Legacy SHA1-only records (from earlier firmware) auto-upgrade to SHA256 on
+  the next successful connect.
+- Both SHA256 and SHA1 fingerprints are logged after each handshake.
+
+```
+sshknown list                  - list stored host trust records
+                                 (host:port, key type, fingerprint)
+sshknown remove <host[:port]>  - remove one pinned record
+sshknown trust  <host[:port]>  - reset the pin so the next connect re-pins the
+                                 server's current key (accept a changed key)
+sshknown clear                 - remove all pinned records
+```
+
+Trust API: `ssh_known_hosts_foreach`, `ssh_known_host_remove`,
+`ssh_known_hosts_clear` (`main/ssh_client.hpp`).
+
+### Transport robustness
+
+- `TCP_NODELAY` is set on the SSH socket so small interactive writes
+  (keystrokes, terminal query replies) are not coalesced/delayed.
+- Application-level keepalive: `libssh2_keepalive_config` at connect plus a
+  periodic `libssh2_keepalive_send` driven from the main-loop pump
+  (`ssh_process_queue`, ~30s) to keep idle links alive and surface dead peers.
+- Decoded transport diagnostics: libssh2 return codes are logged with
+  human-readable names (`ssh_transport_rc_str`), e.g.
+  `rc=-43 (socket-disconnect (transport read/EOF))`.
+- Graded handshake fallback ladder: attempt 1 conservative method profile
+  (CBC/sha1-first, stable on ESP/mbedTLS), attempt 2 broadened modern profile
+  (CTR/sha2-first), attempt 3 libssh2 defaults; the host key preference list
+  is applied on every attempt.
+- Conservative cipher/MAC set on the first attempt:
+  ciphers `aes128-cbc,aes128-ctr,aes256-ctr,aes192-ctr`,
+  MACs `hmac-sha1,hmac-sha2-256,hmac-sha2-512`.
+- PTY dimensions are sent inside `pty-req`; no separate `window-change`
+  request is issued during session startup (Go SSH server compatibility).
+
+### Testing
+
+A Docker-based multi-endpoint SSH test harness for exercising every host key
+type and auth method lives in `test/ssh/server/` (see that directory's
+README and the "SSH Test Harness" section below).
+
+### Known limitation
+
+`curve25519-sha256` KEX in the libssh2 fork requires PSA crypto
+(`MBEDTLS_PSA_CRYPTO_C`), which is not enabled in ESP-IDF's mbedTLS config, so
+that KEX path is non-functional on device. The conservative profile prefers
+`ecdh-sha2-nistp256` first, which works.
 
 ## Runtime Architecture
 
@@ -108,7 +235,7 @@ Compatibility implemented for active editor/shell scenarios:
   the parser is a stateful byte-stream machine and concurrent writers
   (SSH connect task vs main-loop RX drain) corrupted escape sequences
 - Configurable default foreground color:
-  - stored as an xterm/ANSI 256-color index (default `10`, ANSI bright green),
+  - stored as an xterm/ANSI 256-color index (default `255`, white),
     resolved via `color_256()`,
   - public API: `terminal_set/get/load/save_default_fg_index()` and
     `terminal_color_256_rgb888()` (`main/terminal.hpp`),
@@ -148,8 +275,18 @@ Stability hardening:
 - auth flow includes method probe and keyboard-interactive fallback
 - auth order now prefers `none`, then `publickey` (when a key is loaded), then password-style fallback
 - hostkey preference ordering is now built dynamically from client-supported algorithms (prefers `ssh-ed25519`, then ECDSA, then RSA where available)
-- server hostkey fingerprint (SHA1) is logged after handshake as Phase 4 trust-model groundwork
-- host trust uses initial TOFU persistence and rejects host key mismatches for previously seen `host:port`
+- server hostkey fingerprint is logged after handshake (SHA256 OpenSSH-style
+  plus SHA1)
+- host trust uses TOFU persistence keyed by `host:port`, pins the
+  SHA256 fingerprint + key type, and rejects host key mismatches; legacy SHA1
+  records auto-upgrade to SHA256 on the next connect. Trust records are
+  managed with the `sshknown` shell command
+  (`ssh_known_hosts_foreach/ssh_known_host_remove/ssh_known_hosts_clear`)
+- transport polish: `TCP_NODELAY` enabled on the socket;
+  application-level keepalive via `libssh2_keepalive_config/send` (30s) pumped
+  from the main loop; libssh2 transport return codes are decoded to readable
+  names in logs (`ssh_transport_rc_str`); handshake uses a graded fallback
+  ladder (conservative -> broadened modern -> libssh2 defaults)
 - `ssh-ed25519` host keys supported via libssh2 fork (`../../libssh2_esp`,
   `override_path` in `main/idf_component.yml`): ed25519 verification uses
   vendored ref10 code in the mbedTLS backend
@@ -170,6 +307,9 @@ Stability hardening:
 - SSH passthrough mode toggling
 - Password capture callback support (deferred until required by auth probe)
 - `sshkey` shell command adds vault-backed private-key import/load and runtime key management
+- `sshknown` shell command manages host-trust records
+  (`list|remove <host[:port]>|trust <host[:port]>|clear`); `trust` resets a
+  pin so the next connect re-TOFUs a changed host key
 - Escape/arrow/backspace handling integrated with terminal write path
 - Bash-like TAB completion behavior with alphabetized command/subcommand/SSID
   candidate lists and double-TAB candidate display
@@ -212,7 +352,7 @@ Stability hardening:
 - Expanded drawer order (top to bottom): terminal text-color control,
   brightness control, then Wi-Fi/Tailscale/BLE status lines
 - Terminal text-color control:
-  - slider selects xterm/ANSI 256-color index (`0`-`255`), default `10`,
+  - slider selects xterm/ANSI 256-color index (`0`-`255`), default `255`,
   - live color swatch preview,
   - applies + persists via `terminal_set/save_default_fg_index()`,
   - recolors/redraws existing default-colored screen text on change
@@ -265,6 +405,24 @@ export IDF_PATH="$HOME/projects/esp-idf"
 idf.py build
 idf.py -p /dev/ttyACM0 flash
 ```
+
+## SSH Test Harness
+
+A Docker-based multi-endpoint SSH test harness lives in
+`test/ssh/server/`. It launches five OpenSSH endpoints with distinct host key
+types and auth policies to exercise every host key type and auth method from
+the device:
+
+- A (`:2201`) ed25519 hostkey, password auth
+- B (`:2202`) rsa hostkey, publickey-only auth
+- C (`:2203`) ecdsa hostkey, keyboard-interactive auth
+- D (`:2204`) ed25519 hostkey, all auth methods
+- E (`:2205`) rsa hostkey, empty-password (approximate `none`)
+
+`./up.sh` builds/starts the endpoints and prints per-endpoint device commands
+plus the client key to import; `./rotate-hostkey.sh <endpoint>` simulates a
+changed host key for the host-trust mismatch test. See
+`test/ssh/server/README.md`.
 
 ## Current Bug Worklist
 
@@ -408,8 +566,11 @@ Observed:
   - negotiated `aes128-ctr` + `hmac-sha1`
 
 Status:
-- unresolved.
-- immediate regression is fixed, but long-run transport stability issue remains.
+- transport mitigations in place (application keepalive, TCP_NODELAY, decoded
+  transport rc logging) to keep idle links alive and make any recurrence
+  attributable; long-run stability to be re-confirmed against the test
+  harness.
+- immediate regression is fixed.
 
 Planned next steps:
 1. correlate next `rc=-4` with rekey timing/packet flow using existing runtime
@@ -437,6 +598,121 @@ component repo and its `libssh2` submodule (ed25519 ref10 files, mbedtls
 backend, kex/session/channel patches). The firmware cannot be rebuilt
 identically from a clean checkout without that tree. Commit or vendor the
 fork before relying on fresh clones.
+
+## Power-Path / USB->Battery Handover Reboot (2026-06)
+
+### Symptom
+
+With a Li-ion pack on the MX1.25 battery connector AND USB connected, unplugging
+the USB cable causes the device to reboot (LazyVim/boot screen reappears). The
+board boots and runs fine on battery alone (cold start), and survives normal
+operation; only the live USB->battery transition triggers the reset. The reset
+occurs whether unplugging the USB-C (USB 1.1 FS) port or the USB-to-UART port,
+and regardless of whether a serial monitor is attached.
+
+Notable observation: with the battery present, the screen backlight fades out
+slowly on unplug; with NO battery present, the screen goes black instantly.
+
+### Root cause (confirmed): board power-path handover transient
+
+This is a board-level hardware behavior, not a firmware bug and not an ESP32-P4
+configuration problem. Every SoC-side reset source was positively ruled out:
+
+- Brownout detector (TRM Ch23): IDF runs it in Mode 0 with max noise filter
+  (`reset_wait=0x3ff`); threshold lowered to the P4 config floor 2.42V
+  (`ESP_BROWNOUT_DET_LVL_SEL_5`). A diagnostic build that fully disabled the
+  brownout reset (`brownout_ll_reset_config(false,...)` +
+  `brownout_ll_ana_reset_enable(false)`) STILL rebooted on unplug -> not
+  brownout.
+- PSDET / power-glitch detector (TRM Ch24): eFuse `POWERGLITCH_EN = False`
+  (verified with `espefuse.py summary`) -> disabled in silicon, cannot fire.
+- VDD_BAT / RTC battery (TRM 14.4.1.4, 14.4.2.8): on the P4, VDD_BAT is an
+  RTC/AON backup domain only (button cell, 2.5-3.6V), powering the LP/AON
+  domain in deep sleep. It cannot run the HP system. IDF's "RTC Backup
+  Battery" (`ESP_VBAT_INIT_AUTO`) is disabled and irrelevant to runtime power.
+  On this board ESP_VBAT is a separate CR1220 (1220) holder, isolated from the
+  main battery path.
+- USB-Serial-JTAG reset (codes 0x16/0x17), watchdogs, lockup: ruled out by the
+  captured reset reason.
+
+The decisive evidence: a boot-time `esp_reset_reason()` log
+(`=== BOOT reset_reason=N (...) ===`, added in `main/console_base.cpp`)
+reported `reset_reason=1 (POWERON)` after an unplug event, with the brownout
+reset disabled. POWERON (chip power-up, TRM Ch10 code 0x01) means the P4 core
+supply was momentarily lost and re-applied.
+
+Board power-path topology (from the Waveshare schematic):
+
+```
+USB0_5V (USB-C)  --[Q2 AO3401 P-FET, U4/R25/R26 bias]--\
+                                                        >-- VCC'_5V -- VCC_5V
+USB1_5V (UART-C) --[Q5 AO3401 P-FET, U23 bias]---------/                 |
+                                                                         |
+BAT (MX1.25) --[U21 sync boost, EN tied on via R131]--> Boost_5V         |
+                          --[Q3 AO3401 P-FET, U18 MMDT3906DW/R74/R80]-----+
+                                  (auto-handover, biased OFF while VCC_5V present)
+
+VCC_5V --[load switch, EN_DCDC + 4.7uF soft-start C19; SW2/Q8 soft-latch]--> Core_5V
+Core_5V --[buck DCDC]--> ESP_3V3 / ESP_VDD_HP --> ESP32-P4
+Core_5V --[boost]--> ~9.6V display/backlight rail (large caps)
+
+Separate: ESP_VBAT <- CR1220 RTC cell only (isolated)
+```
+
+Mechanism: the source handover is active-transistor-biased, not an ideal-diode
+OR. The battery boost (U21) is always enabled, but its pass FET Q3 is biased
+OFF while USB-derived `VCC_5V` is present and only turns ON after `VCC_5V`
+decays enough to flip the U18/R74/R80 bias network. During that bias-flip
+dead-time `VCC_5V` dips. The dip is enough that the `Core_5V` enable path
+(GPIO-driven `EN_DCDC` with the 4.7uF soft-start cap C19, plus the SW2/Q8
+latch) momentarily drops the P4 core rail, power-cycling the chip -> POWERON.
+
+This is consistent with the backlight observation: the ~9.6V display rail has
+large bulk caps and fades slowly, while the lightly-buffered P4 core rail
+collapses for a few ms during the handover dead-time.
+
+### Hardware fix options (no firmware fix is possible)
+
+Because the P4 loses its own core supply during the handover, the remedy is on
+the board:
+
+1. Bulk capacitance on `Core_5V` (recommended first try): a large low-ESR cap
+   (e.g. 470-1000uF) holds `Core_5V`/`VCC_5V` above the buck's dropout/enable
+   through the Q3 bias-flip dead-time.
+2. Schottky diode `Boost_5V -> VCC_5V`: lets the always-on battery boost catch
+   `VCC_5V` with near-zero dead-time, so the enable path never sees the dip.
+   Cleanest targeted mod.
+3. Reduce Q3 turn-on delay (smaller R74) - riskier board rework.
+
+### Attaching a bulk cap via a peripheral pigtail jack
+
+The CAN and RS485 PH2.0 jacks both expose `Core_5V` directly:
+
+- CAN jack `H11`: pin 1 = `Core_5V`, pin 2 = `GND` (pin 3 CANH, pin 4 CANL).
+- RS485 jack `H9`: pin 1 = `Core_5V`, pin 2 = `GND` (pin 3 A, pin 4 B).
+
+Use H11 pin1/pin2 or H9 pin1/pin2 (cap + to `Core_5V`, - to `GND`). Observe
+capacitor polarity and voltage rating (>= 10V for a 5V rail).
+
+Do NOT use these for the cap (wrong rail):
+- I2C jack `H10` / UART jack `H8` pin 1 "VCC": defaults to `ESP_3V3` via the
+  `H3` 0R jumper (post-buck 3.3V), not `Core_5V`.
+- 12-pin headers `P1`/`P3`: expose only `ESP_3V3`, `BAT`, `ESP_LDO_VO4`, `GND`
+  - no 5V rail.
+- Raw `USB0_5V`/`USB1_5V`/`VBUS_OUT`: before the OR/handover stage.
+
+`Core_5V` is the correct node because it is post-OR, post-load-switch, and the
+exact rail that dips during the USB->battery handover.
+
+### Firmware disposition
+
+- Permanent: boot-time reset-reason logging in `main/console_base.cpp`
+  (`reset_reason_str()` decodes all P4 reset causes incl. PWR_GLITCH/PSDET,
+  BROWNOUT, USB, POWERON).
+- Brownout threshold lowered to 2.42V (`ESP_BROWNOUT_DET_LVL_SEL_5`) in
+  `sdkconfig.defaults.esp32p4`; harmless and slightly more tolerant, though it
+  was not the cause. Brownout reset protection remains ENABLED.
+- The TEST-ONLY brownout-disable diagnostic was removed after root-causing.
 
 ## Known Quirks and Workarounds
 
