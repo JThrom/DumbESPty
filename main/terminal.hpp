@@ -113,8 +113,7 @@ bool terminal_scrollback_active(const terminal_t *term);
 // Default terminal foreground color, as an xterm/ANSI 256-color index (0-255).
 // Setting it changes the color used wherever the terminal resets to its
 // default text color (new cells, SGR reset, SGR 39). Existing already-drawn
-// cells keep their stored color until rewritten. Default index is 10 (ANSI
-// bright green).
+// cells keep their stored color until rewritten. Default index is 255 (white).
 void terminal_set_default_fg_index(int index);
 int terminal_get_default_fg_index(void);
 

@@ -41,9 +41,9 @@ static constexpr bool kEnableGlyphHalo = false;
 #define RGB565_WHITE     RGB565(255, 255, 255)
 
 // Default terminal foreground color, expressed as an xterm/ANSI 256-color
-// index (0-255). Index 10 is ANSI bright green, the default text color.
+// index (0-255). Index 255 is white, the default text color.
 // Configurable at runtime via terminal_set_default_fg_index().
-#define DEFAULT_FG_INDEX_DEFAULT  10
+#define DEFAULT_FG_INDEX_DEFAULT  255
 static int s_default_fg_index = DEFAULT_FG_INDEX_DEFAULT;
 
 // Active terminal instance, captured in terminal_init(), so color changes from

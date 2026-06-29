@@ -65,7 +65,7 @@ Active font assets:
   - On current P4 panel (`1024 x 600`), baseline grid is `128 x 40`.
 - Keep Cozette primary + LVGL fallback font flow.
 - Default terminal foreground is now an xterm/ANSI 256-color index (default
-  `10`, ANSI bright green), configurable via the status-menu slider and
+  `255`, white), configurable via the status-menu slider and
   persisted in NVS (`devicecfg`/`termfg`). The default resolves through
   `color_256()` in `main/terminal.cpp`; see `terminal_set/get/load/save_default_fg_index`
   and `terminal_color_256_rgb888` in `main/terminal.hpp`.
@@ -77,7 +77,7 @@ TUI rendering). Three distinct bugs were fixed; all were root-caused with a
 host-side reproduction harness that compiles the forked libssh2 + ESP-IDF's
 mbedTLS 3.6.4 natively on Linux (scratch dir `/tmp/opencode/sshdbg`).
 
-1. `ssh-ed25519` host key support (SSH roadmap Phase 1, done):
+1. `ssh-ed25519` host key support:
    - terminal.shop offers ONLY `ssh-ed25519` host keys (verified via
      `ssh -vv`); the old build had `LIBSSH2_ED25519 0` so KEX negotiation
      had no hostkey overlap (`rc=-5`/`rc=-8`).
@@ -142,20 +142,47 @@ Build reproducibility warning:
 
 3. Intermittent SSH runtime `rc=-4` disconnects (see `SPEC.md`).
 
-## SSH Compatibility Roadmap (Phased)
+## SSH Authentication & Trust (implemented)
 
-1. Phase 1: host key compatibility (DONE 2026-06)
-   - Client supports `ssh-ed25519` host keys via libssh2 fork
-     (ref10 verify in mbedTLS backend).
-2. Phase 2: auth method coverage
-   - Ensure robust `publickey`, `keyboard-interactive`, `password`, `none`
-     negotiation behavior.
-3. Phase 3: key management
-   - Vault-backed key storage/import and passphrase handling.
-4. Phase 4: host trust model
-   - `known_hosts`/fingerprint pinning and mismatch protections.
-5. Phase 5: compatibility polish
-   - Improve default preferences/fallbacks to match Linux-client expectations.
+Full supported-mode reference is in `SPEC.md` "SSH Authentication & Trust".
+Summary of what exists; do not regress these:
+
+- Host keys: `ssh-ed25519` (via libssh2 fork, ref10 verify in mbedTLS), ECDSA
+  (nistp256/384/521), RSA. Preference list built dynamically and applied on
+  every handshake attempt (`build_hostkey_method_pref`).
+- Auth methods: `none` (probed first), `publickey` (key from runtime slot),
+  `keyboard-interactive`, `password`, with sensible fallback ordering in the
+  `ssh_connect` auth block.
+- Key management: `sshkey status|import|load|clear|erase`; keys stored
+  AES-encrypted in the secret vault (`secret_vault.cpp`), passphrase-capable.
+- Host trust: TOFU SHA256 pinning per `host:port` (NVS `sshtrust`), mismatch
+  hard-fail, legacy SHA1 auto-upgrade; managed via
+  `sshknown list|remove|trust|clear`.
+- Transport: `TCP_NODELAY`, app-level keepalive
+  (`libssh2_keepalive_config/send`), decoded transport rc logging
+  (`ssh_transport_rc_str`), graded handshake fallback ladder, PTY dimensions
+  sent inside `pty-req` (no separate startup `window-change`).
+- Test harness: `test/ssh/server/` (Docker, multi-endpoint, all auth modes).
+
+## Power-Path / USB->Battery Reboot (Hardware, Not Firmware)
+
+- Symptom: with a Li-ion pack on the MX1.25 connector AND USB connected,
+  unplugging USB reboots the device (reset_reason=POWERON). Battery-alone cold
+  start works fine.
+- Root-caused (2026-06) to a board-level power-path handover transient: the
+  battery-boost pass FET (Q3, AO3401, U18/R74/R80 bias) only turns on after
+  USB-derived `VCC_5V` decays, creating a dead-time dip that briefly
+  power-cycles the P4 core rail via the `EN_DCDC`/soft-start + SW2/Q8 latch.
+- This is NOT fixable in firmware. Every SoC reset source was ruled out:
+  brownout (disabled-diagnostic still rebooted), PSDET (eFuse `POWERGLITCH_EN`
+  off), VDD_BAT (RTC-only domain), USB/WDT (wrong reset reason).
+- Do NOT spend effort trying to fix this in firmware. The fix is a hardware
+  bulk cap on `Core_5V` (or a Schottky `Boost_5V`->`VCC_5V`). The CAN jack `H11`
+  and RS485 jack `H9` expose `Core_5V` on pin 1 / `GND` on pin 2 for attaching
+  a cap. Full details + topology in `SPEC.md` "Power-Path / USB->Battery
+  Handover Reboot".
+- Keep the boot-time reset-reason log in `main/console_base.cpp`; it is the
+  diagnostic that attributes any future power/reset anomaly.
 
 ## Input Compatibility Notes
 
@@ -200,13 +227,20 @@ Build reproducibility warning:
   (`libssh2_channel_request_pty_ex`).
 - Do not remove the `terminal_write` serialization mutex; concurrent parser
   writes corrupt escape sequences and drop terminal query replies.
+- Do not remove the SSH application keepalive (`libssh2_keepalive_config` at
+  connect + periodic `libssh2_keepalive_send` in `ssh_process_queue`) or
+  `TCP_NODELAY`; both are transport-stability/latency measures.
+- Keep the graded handshake fallback ladder in `ssh_client.cpp` (attempt 1
+  conservative, attempt 2 broadened modern, attempt 3 libssh2 defaults) and
+  apply the hostkey preference list on every attempt so ed25519-only servers
+  keep negotiating.
 - Do not remove the OSC 10/11 color-query replies or ST-terminated OSC
   dispatch in `terminal.cpp`; bubbletea/lipgloss TUI servers block on them.
   The OSC 10 reply now reflects the configured default fg index; keep it in
   sync with `default_fg()` rather than hardcoding a color again.
 - Do not revert the terminal default foreground to the old custom pure green
   (`RGB565(0,255,0)`); it was display-specific. Default fg is an xterm/ANSI
-  256-color index (default `10`) routed through `color_256()`.
+  256-color index (default `255`, white) routed through `color_256()`.
 
 ## Git and Safety Guidance
 

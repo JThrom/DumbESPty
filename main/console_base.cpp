@@ -14,10 +14,36 @@
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_crypto_lock.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "lvgl.h"
 
 static const char *TAG = "console";
+
+// Decode the last reset reason so USB->battery unplug reboots are attributable:
+//   POWERON  -> system rail actually collapsed (hardware power-path gap)
+//   BROWNOUT -> rail dipped below the detector threshold (recoverable in fw)
+//   others   -> software/panic/watchdog, not a power event.
+static const char *reset_reason_str(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "POWERON (cold start / rail collapse)";
+        case ESP_RST_EXT:       return "EXT (external pin)";
+        case ESP_RST_SW:        return "SW (esp_restart)";
+        case ESP_RST_PANIC:     return "PANIC (exception/abort)";
+        case ESP_RST_INT_WDT:   return "INT_WDT (interrupt watchdog)";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT (task watchdog)";
+        case ESP_RST_WDT:       return "WDT (other watchdog)";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT (rail dip below detector)";
+        case ESP_RST_SDIO:      return "SDIO";
+        case ESP_RST_USB:       return "USB (usb-serial-jtag host reset)";
+        case ESP_RST_JTAG:      return "JTAG";
+        case ESP_RST_EFUSE:     return "EFUSE (efuse crc error)";
+        case ESP_RST_PWR_GLITCH:return "PWR_GLITCH (PSDET voltage-glitch reset)";
+        case ESP_RST_CPU_LOCKUP:return "CPU_LOCKUP (double exception)";
+        default:                return "UNKNOWN";
+    }
+}
 static lv_obj_t *status_label = NULL;
 static terminal_t terminal;
 
@@ -44,6 +70,17 @@ static void lv_tick_task(void *arg) {
 
 extern "C" void app_main(void) {
     esp_err_t ret;
+
+    // Reset-reason logging is retained permanently: it is cheap and makes any
+    // future power/reset anomaly attributable. The USB->battery unplug reboot
+    // was root-caused (2026-06) to a board-level power-path handover transient
+    // that briefly power-cycles the P4 core rail (reset_reason=POWERON even
+    // with the brownout reset disabled). See SPEC.md "Power-Path / USB->Battery
+    // Handover Reboot" for the full investigation and the hardware fix. The
+    // earlier TEST-ONLY brownout-disable diagnostic has been removed; brownout
+    // reset protection is restored (configured via sdkconfig, threshold 2.42V).
+    esp_reset_reason_t rst = esp_reset_reason();
+    ESP_LOGW(TAG, "=== BOOT reset_reason=%d (%s) ===", (int)rst, reset_reason_str(rst));
 
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
