@@ -27,3 +27,10 @@ a.out
 
 # Experimental local assets
 main/assets/
+
+# Host unit-test coverage artifacts (build/ is already ignored, but keep these
+# in case gcov output lands elsewhere during local runs)
+*.gcda
+*.gcno
+*.gcov
+coverage/
