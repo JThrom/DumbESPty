@@ -243,6 +243,7 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "Tailscale init OK");
 
     power_install_hooks();
+    idle_timeout_load();  // apply persisted idle timeout (after power_mgr init)
 
     while (1) {
         ble_hid_process_queue();

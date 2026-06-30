@@ -14,6 +14,7 @@ power_mgr_hooks_t s_hooks = {};
 bool s_have_hooks = false;
 
 uint32_t s_last_activity_ms = 0;
+uint32_t s_idle_timeout_ms = POWER_IDLE_TIMEOUT_MS;
 bool s_low_power = false;
 int s_saved_brightness = -1;
 
@@ -48,11 +49,16 @@ void power_mark_activity(void) {
 }
 
 unsigned power_mgr_step(void) {
+    // A timeout of 0 disables automatic low-power entry entirely.
+    if (s_idle_timeout_ms == 0) {
+        return s_low_power ? POWER_LOOP_DELAY_IDLE_MS : POWER_LOOP_DELAY_ACTIVE_MS;
+    }
+
     const uint32_t now = now_ms();
     // Unsigned subtraction is wrap-safe for a monotonic millisecond clock.
     const uint32_t idle = now - s_last_activity_ms;
 
-    if (!s_low_power && idle >= POWER_IDLE_TIMEOUT_MS) {
+    if (!s_low_power && idle >= s_idle_timeout_ms) {
         if (s_have_hooks && s_hooks.brightness_supported &&
             s_hooks.get_brightness && s_hooks.set_brightness) {
             s_saved_brightness = s_hooks.get_brightness();
@@ -66,4 +72,14 @@ unsigned power_mgr_step(void) {
 
 bool power_mgr_is_low_power(void) {
     return s_low_power;
+}
+
+void power_mgr_set_idle_timeout_ms(uint32_t timeout_ms) {
+    s_idle_timeout_ms = timeout_ms;
+    // Treat the change as activity so it applies from now, not retroactively.
+    s_last_activity_ms = now_ms();
+}
+
+uint32_t power_mgr_get_idle_timeout_ms(void) {
+    return s_idle_timeout_ms;
 }

@@ -1,5 +1,6 @@
 #include "shell.hpp"
 #include "power_mgr.hpp"
+#include "nvs.h"
 #include "hostname_mgr.hpp"
 #include "secret_vault.hpp"
 #include "ssh_client.hpp"
@@ -1456,6 +1457,72 @@ static void cmd_mac_handler(int argc, char **argv) {
     shell_print("\r\n  usage: mac | mac set <xx:xx:xx:xx:xx:xx>");
 }
 
+// --- idleTimeout command -----------------------------------------------------
+// Shows/sets the idle low-power timeout (seconds). 0 disables auto low-power.
+// Persisted in NVS ("devicecfg"/"idletmo", stored in milliseconds as u32).
+static constexpr char IDLE_CFG_NS[] = "devicecfg";
+static constexpr char IDLE_TMO_KEY[] = "idletmo";
+
+static esp_err_t idle_timeout_save(uint32_t timeout_ms) {
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(IDLE_CFG_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u32(nvs, IDLE_TMO_KEY, timeout_ms);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+void idle_timeout_load(void) {
+    nvs_handle_t nvs = 0;
+    if (nvs_open(IDLE_CFG_NS, NVS_READONLY, &nvs) != ESP_OK) return;
+    uint32_t timeout_ms = POWER_IDLE_TIMEOUT_MS;
+    if (nvs_get_u32(nvs, IDLE_TMO_KEY, &timeout_ms) == ESP_OK) {
+        power_mgr_set_idle_timeout_ms(timeout_ms);
+    }
+    nvs_close(nvs);
+}
+
+static void cmd_idle_timeout(int argc, char **argv) {
+    if (argc == 1) {
+        uint32_t ms = power_mgr_get_idle_timeout_ms();
+        char line[80];
+        if (ms == 0) {
+            shell_print("\r\n  idle timeout: 0s (disabled; device stays awake)");
+        } else {
+            snprintf(line, sizeof(line), "\r\n  idle timeout: %us", (unsigned)(ms / 1000));
+            shell_print(line);
+        }
+        return;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "set") == 0) {
+        char *end = NULL;
+        long secs = strtol(argv[2], &end, 10);
+        if (*end != '\0' || secs < 0 || secs > 86400) {
+            shell_print("\r\n  invalid value (use 0..86400 seconds; 0 disables)");
+            return;
+        }
+        uint32_t ms = (uint32_t)secs * 1000u;
+        power_mgr_set_idle_timeout_ms(ms);
+        esp_err_t err = idle_timeout_save(ms);
+        if (err != ESP_OK) {
+            shell_print("\r\n  applied, but failed to persist to NVS");
+            return;
+        }
+        char line[80];
+        if (secs == 0) {
+            shell_print("\r\n  idle timeout disabled (device stays awake)");
+        } else {
+            snprintf(line, sizeof(line), "\r\n  idle timeout set: %lds", secs);
+            shell_print(line);
+        }
+        return;
+    }
+
+    shell_print("\r\n  usage: idleTimeout | idleTimeout set <seconds>  (0 disables)");
+}
+
 void shell_init(terminal_t *t) {
     term = t;
 
@@ -1478,6 +1545,7 @@ void shell_init(terminal_t *t) {
     shell_register_cmd("mac", cmd_mac_handler);
     shell_register_cmd("vault", cmd_vault);
     shell_register_cmd("about", cmd_about_handler);
+    shell_register_cmd("idleTimeout", cmd_idle_timeout);
 
     terminal_write(term, "$ ", -1);
 }

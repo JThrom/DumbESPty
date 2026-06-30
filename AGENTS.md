@@ -242,13 +242,18 @@ Summary of what exists; do not regress these:
 - Do not revert the terminal default foreground to the old custom pure green
   (`RGB565(0,255,0)`); it was display-specific. Default fg is an xterm/ANSI
   256-color index (default `255`, white) routed through `color_256()`.
-- Keep idle low-power activity hooks intact: `shell_handle_key` and the
-  `ssh_process_queue` drain (`drained > 0`) must call `power_mark_activity()`,
-  and the main loop must apply the `power_mgr_step()` return as its
-  `vTaskDelay`. Removing these makes the screen sleep during active SSH output
-  or never wake on input. Backlight changes must go through
-  `waveshare_display_set_brightness` (not raw GPIO) so the backlight keepalive
-  task does not revert them. Idle timeout is `POWER_IDLE_TIMEOUT_MS` (30s).
+- Keep idle low-power activity hooks intact: `shell_handle_key`, the touch
+  press path in `touch_read_cb` (`ui_status_menu.cpp`), and the
+  `ssh_process_queue` drain (`drained > 0`) must each call
+  `power_mark_activity()`, and the main loop must apply the `power_mgr_step()`
+  return as its `vTaskDelay`. Removing these makes the screen sleep during
+  active SSH output or never wake on input/touch. Backlight changes must go
+  through `waveshare_display_set_brightness` (not raw GPIO) so the backlight
+  keepalive task does not revert them. The idle timeout is runtime-configurable
+  via the `idleTimeout` shell command (NVS `devicecfg`/`idletmo`, ms as u32;
+  default `POWER_IDLE_TIMEOUT_MS` = 30s, `0` disables). Load it at boot via
+  `idle_timeout_load()` after `power_install_hooks()`. Keep NVS out of
+  `power_mgr.cpp` (it is host-unit-tested); persistence belongs in `shell.cpp`.
 
 ## Git and Safety Guidance
 

@@ -14,6 +14,7 @@
 #include "esp_lcd_touch_gt911.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "power_mgr.hpp"
 #include "tailscale_mgr.hpp"
 #include "terminal.hpp"
 #include "waveshare_display.hpp"
@@ -220,6 +221,8 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
         data->state = LV_INDEV_STATE_PRESSED;
         data->point.x = point[0].x;
         data->point.y = point[0].y;
+        // Touch counts as user activity: wake the device from low-power.
+        power_mark_activity();
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }

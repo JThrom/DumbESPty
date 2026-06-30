@@ -17,6 +17,10 @@ void shell_get_hidden_input(void (*callback)(const char *input));
 void shell_set_ssh_active(bool active);
 bool shell_is_ssh_active(void);
 
+// Load the persisted idle low-power timeout from NVS and apply it to power_mgr.
+// Call once at startup after power_mgr is initialized.
+void idle_timeout_load(void);
+
 #ifdef __cplusplus
 }
 #endif

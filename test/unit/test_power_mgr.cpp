@@ -35,6 +35,8 @@ protected:
         g_set_calls = 0;
         g_last_set = -999;
         installHooks(true);
+        // Timeout is module-static and persists across tests; reset to default.
+        power_mgr_set_idle_timeout_ms(POWER_IDLE_TIMEOUT_MS);
     }
 
     void installHooks(bool brightness_supported) {
@@ -149,9 +151,65 @@ TEST_F(PowerMgrTest, ClockWrapAroundIsHandled) {
     // Start the activity timestamp near UINT32_MAX, then wrap the clock.
     g_now = 0xFFFFFFF0u;
     installHooks(true);                // last_activity = 0xFFFFFFF0
+    power_mgr_set_idle_timeout_ms(POWER_IDLE_TIMEOUT_MS);
     g_now += POWER_IDLE_TIMEOUT_MS;    // wraps past zero
     EXPECT_EQ(power_mgr_step(), POWER_LOOP_DELAY_IDLE_MS);
     EXPECT_TRUE(power_mgr_is_low_power());
+}
+
+// --- configurable / disable-able timeout -------------------------------------
+
+TEST_F(PowerMgrTest, DefaultTimeoutGetterMatchesDefine) {
+    EXPECT_EQ(power_mgr_get_idle_timeout_ms(), (uint32_t)POWER_IDLE_TIMEOUT_MS);
+}
+
+TEST_F(PowerMgrTest, CustomTimeoutIsHonored) {
+    power_mgr_set_idle_timeout_ms(5000);
+    EXPECT_EQ(power_mgr_get_idle_timeout_ms(), 5000u);
+
+    advance(4999);
+    EXPECT_EQ(power_mgr_step(), POWER_LOOP_DELAY_ACTIVE_MS);
+    EXPECT_FALSE(power_mgr_is_low_power());
+
+    advance(1);                        // total 5000
+    EXPECT_EQ(power_mgr_step(), POWER_LOOP_DELAY_IDLE_MS);
+    EXPECT_TRUE(power_mgr_is_low_power());
+}
+
+TEST_F(PowerMgrTest, ZeroTimeoutDisablesLowPower) {
+    power_mgr_set_idle_timeout_ms(0);
+    EXPECT_EQ(power_mgr_get_idle_timeout_ms(), 0u);
+
+    advance(POWER_IDLE_TIMEOUT_MS * 10);   // far beyond any normal timeout
+    EXPECT_EQ(power_mgr_step(), POWER_LOOP_DELAY_ACTIVE_MS);
+    EXPECT_FALSE(power_mgr_is_low_power());
+    EXPECT_EQ(g_set_calls, 0);             // backlight never touched
+}
+
+TEST_F(PowerMgrTest, SettingTimeoutResetsIdleTimer) {
+    advance(POWER_IDLE_TIMEOUT_MS - 5);    // almost idle on the default timeout
+    power_mgr_set_idle_timeout_ms(POWER_IDLE_TIMEOUT_MS);  // resets the timer
+    advance(10);                           // would have tripped the old deadline
+    EXPECT_EQ(power_mgr_step(), POWER_LOOP_DELAY_ACTIVE_MS);
+    EXPECT_FALSE(power_mgr_is_low_power());
+}
+
+TEST_F(PowerMgrTest, DisablingWhileIdleStopsFurtherSleepButKeepsState) {
+    // Enter low-power on a short timeout, then disable.
+    power_mgr_set_idle_timeout_ms(1000);
+    advance(1000);
+    power_mgr_step();
+    EXPECT_TRUE(power_mgr_is_low_power());
+
+    // Disabling does not force a wake on its own; activity (key/touch) does.
+    power_mgr_set_idle_timeout_ms(0);
+    power_mark_activity();
+    EXPECT_FALSE(power_mgr_is_low_power());
+
+    // With timeout disabled it never re-sleeps.
+    advance(POWER_IDLE_TIMEOUT_MS * 10);
+    EXPECT_EQ(power_mgr_step(), POWER_LOOP_DELAY_ACTIVE_MS);
+    EXPECT_FALSE(power_mgr_is_low_power());
 }
 
 }  // namespace

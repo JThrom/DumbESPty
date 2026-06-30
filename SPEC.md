@@ -386,11 +386,18 @@ Stability hardening:
 ### Idle Low-Power Manager (`main/power_mgr.cpp`, `main/power_mgr.hpp`)
 
 Saves battery by dimming the display and slowing the main loop when the device
-is unattended. "Activity" is any user HID key (USB or BLE) or any SSH terminal
-output reaching the screen.
+is unattended. "Activity" is any user HID key (USB or BLE), any touchscreen
+press, or any SSH terminal output reaching the screen.
 
-- **Idle timeout:** `POWER_IDLE_TIMEOUT_MS` (currently `30000`, i.e. 30s with
-  no input and no SSH output).
+- **Idle timeout:** runtime-configurable, default `POWER_IDLE_TIMEOUT_MS`
+  (`30000`, i.e. 30s with no input/touch/SSH output). Configured via the
+  `idleTimeout` shell command and persisted in NVS
+  (`devicecfg`/`idletmo`, stored in milliseconds as `u32`). Loaded at boot by
+  `idle_timeout_load()` (`main/shell.cpp`) right after `power_install_hooks()`
+  in `console_base.cpp`.
+- **Disable:** `idleTimeout set 0` disables automatic low-power entirely; the
+  device never sleeps on its own (`power_mgr_step` returns the active delay and
+  never touches the backlight while the timeout is 0).
 - **Low-power entry:** backlight turned off via
   `waveshare_display_set_brightness(0)` (the current brightness is saved first),
   and the main-loop delay rises from `POWER_LOOP_DELAY_ACTIVE_MS` (10ms / 100Hz)
@@ -400,17 +407,30 @@ output reaching the screen.
 - **Activity sources / chokepoints:**
   - `shell_handle_key()` (`main/shell.cpp`) calls `power_mark_activity()` for
     every key from either HID transport.
+  - `touch_read_cb()` (`main/ui_status_menu.cpp`) calls `power_mark_activity()`
+    on every detected touch press (GT911 via `esp_lcd_touch`). The touch read
+    runs in `lv_timer_handler()` and still fires during the slowed idle loop, so
+    a touch wakes the device.
   - `ssh_process_queue()` (`main/ssh_client.cpp`) calls `power_mark_activity()`
     whenever it drains > 0 RX messages to the terminal. SSH keepalives are
     outbound and do not enqueue RX bytes, so they do not falsely keep the screen
     awake.
+- **`idleTimeout` shell command:**
+  - `idleTimeout` — print the current timeout in seconds (or "disabled").
+  - `idleTimeout set <seconds>` — set the timeout (range 0..86400). `0` disables
+    auto low-power. The value is applied immediately (also resets the idle
+    timer) and persisted to NVS.
 - **Design / testability:** the decision logic in `power_mgr.cpp` is
   hardware-independent. The clock and backlight are injected via
-  `power_mgr_hooks_t` (`power_mgr_init`). `console_base.cpp` installs the real
-  hooks (FreeRTOS tick clock + Waveshare backlight). Host unit tests
-  (`test/unit/test_power_mgr.cpp`) inject deterministic fakes and cover the full
-  state machine including timeout boundary, brightness save/restore, idempotent
-  steps, the unsupported-backlight path, and millisecond-clock wraparound.
+  `power_mgr_hooks_t` (`power_mgr_init`). The idle timeout is a runtime variable
+  (`power_mgr_set/get_idle_timeout_ms`); NVS persistence lives in `shell.cpp`,
+  not `power_mgr.cpp`, to keep the latter include-minimal and host-testable.
+  `console_base.cpp` installs the real hooks (FreeRTOS tick clock + Waveshare
+  backlight). Host unit tests (`test/unit/test_power_mgr.cpp`) inject
+  deterministic fakes and cover the full state machine including timeout
+  boundary, brightness save/restore, idempotent steps, the unsupported-backlight
+  path, millisecond-clock wraparound, custom/configurable timeouts, and the
+  disabled (`0`) timeout.
 - **Scope (deliberate):** this is software-level power saving only (backlight +
   loop cadence). It does NOT enable `esp_pm` / `esp_light_sleep`; that path is
   intentionally avoided because of the active USB-host, NimBLE, and MIPI-DSI
