@@ -20,6 +20,7 @@ the sources reference. The covered logic includes:
 | `main/hostname_mgr.cpp` | hostname validation/normalization, MAC-derived defaults, NVS persistence, `hostname` shell command |
 | `main/usb_hid_host.cpp` | USB HID boot-keyboard keycode → ASCII mapping (shift/ctrl/arrows/keypad), report de-duplication |
 | `main/ssh_client.cpp` | transport return-code decoding, FNV-1a trust-key hashing, tailnet IPv4 detection, host-key method-preference ordering, SHA256 fingerprint formatting, DSR fast-query filtering |
+| `main/power_mgr.cpp` | idle low-power state machine: timeout boundary, backlight off/restore, brightness save, idempotent steps, unsupported-backlight path, millisecond-clock wraparound (clock + backlight injected via hooks) |
 
 Coverage numbers for big files (e.g. `terminal.cpp`, `ssh_client.cpp`) are
 intentionally partial: the uncovered lines are the LVGL draw path and the live
@@ -64,6 +65,7 @@ test/unit/
   test_hostname.cpp     # hostname manager tests
   test_usb_hid.cpp      # USB HID keymap tests (white-box include of source)
   test_ssh_helpers.cpp  # SSH pure-helper tests (white-box include of source)
+  test_power_mgr.cpp    # idle low-power state machine tests (injected fakes)
   test_support.hpp      # shared test helpers
   mocks/                # mock headers + stub implementations for SDK symbols
     esp_*.h, nvs.h, lvgl.h, libssh2.h, freertos/*, usb/*, lwip/*, mbedtls/*

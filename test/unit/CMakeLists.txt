@@ -76,6 +76,7 @@ target_include_directories(test_mocks PUBLIC ${COMMON_INCLUDES})
 add_library(firmware_under_test STATIC
   ${MAIN_DIR}/terminal.cpp
   ${MAIN_DIR}/hostname_mgr.cpp
+  ${MAIN_DIR}/power_mgr.cpp
   ${MAIN_DIR}/fonts/cozette_bdf_13.c
 )
 target_include_directories(firmware_under_test PUBLIC ${COMMON_INCLUDES})
@@ -94,6 +95,7 @@ add_executable(unit_tests
   test_hostname.cpp
   test_usb_hid.cpp
   test_ssh_helpers.cpp
+  test_power_mgr.cpp
 )
 target_include_directories(unit_tests PRIVATE ${COMMON_INCLUDES})
 target_compile_options(unit_tests PRIVATE ${COVERAGE_FLAGS})
@@ -121,6 +123,7 @@ if(GCOVR_EXECUTABLE)
             ${CMAKE_BINARY_DIR}/CMakeFiles/unit_tests.dir/test_hostname.cpp.gcda
             ${CMAKE_BINARY_DIR}/CMakeFiles/unit_tests.dir/test_usb_hid.cpp.gcda
             ${CMAKE_BINARY_DIR}/CMakeFiles/unit_tests.dir/test_ssh_helpers.cpp.gcda
+            ${CMAKE_BINARY_DIR}/CMakeFiles/unit_tests.dir/test_power_mgr.cpp.gcda
     COMMAND ctest --output-on-failure
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/coverage
     COMMAND ${GCOVR_EXECUTABLE}

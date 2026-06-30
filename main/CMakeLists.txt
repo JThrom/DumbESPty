@@ -1,6 +1,7 @@
 set(srcs
     "console_base.cpp"
     "ch422g_init.cpp"
+    "power_mgr.cpp"
     "shell.cpp"
     "ui_status_menu.cpp"
     "wifi_mgr.cpp"

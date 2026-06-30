@@ -1,4 +1,5 @@
 #include "shell.hpp"
+#include "power_mgr.hpp"
 #include "hostname_mgr.hpp"
 #include "secret_vault.hpp"
 #include "ssh_client.hpp"
@@ -495,6 +496,7 @@ bool shell_is_ssh_active(void) {
 }
 
 void shell_handle_key(char c) {
+    power_mark_activity();
     if ((uint8_t)c == 0x80) {
         terminal_scrollback_step(term, 1);
         shell_pump_ui();

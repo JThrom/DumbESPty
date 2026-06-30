@@ -9,6 +9,7 @@
 #include "ssh_client.hpp"
 #include "tailscale_mgr.hpp"
 #include "terminal.hpp"
+#include "power_mgr.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -46,6 +47,24 @@ static const char *reset_reason_str(esp_reset_reason_t r) {
 }
 static lv_obj_t *status_label = NULL;
 static terminal_t terminal;
+
+// --- Idle low-power management ------------------------------------------------
+// Decision logic lives in power_mgr.cpp (host-unit-testable). Here we provide
+// the hardware hooks: a millisecond clock from the FreeRTOS tick and the
+// Waveshare backlight driver. When idle for POWER_IDLE_TIMEOUT_MS the backlight
+// is turned off and the main loop slows; any input/SSH output wakes instantly.
+static uint32_t power_now_ms(void) {
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static void power_install_hooks(void) {
+    power_mgr_hooks_t hooks = {};
+    hooks.now_ms = power_now_ms;
+    hooks.get_brightness = waveshare_display_get_brightness;
+    hooks.set_brightness = [](int p) { waveshare_display_set_brightness(p); };
+    hooks.brightness_supported = waveshare_display_brightness_supported();
+    power_mgr_init(&hooks);
+}
 
 static void warm_crypto_locks(void) {
     esp_crypto_mpi_lock_acquire();
@@ -223,6 +242,8 @@ extern "C" void app_main(void) {
     else
         ESP_LOGI(TAG, "Tailscale init OK");
 
+    power_install_hooks();
+
     while (1) {
         ble_hid_process_queue();
         usb_hid_process_queue();
@@ -234,6 +255,8 @@ extern "C" void app_main(void) {
         ui_status_menu_update();
         terminal_render(&terminal);
         lv_timer_handler();
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        unsigned delay_ms = power_mgr_step();
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }

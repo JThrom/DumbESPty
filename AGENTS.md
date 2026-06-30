@@ -46,6 +46,7 @@ Core modules in active use:
 - `main/ssh_client.cpp`, `main/ssh_client.hpp`
 - `main/shell.cpp`, `main/shell.hpp`
 - `main/wifi_mgr.cpp`, `main/wifi_mgr.hpp`
+- `main/power_mgr.cpp`, `main/power_mgr.hpp`
 - `main/ble_hid_host.cpp`, `main/ble_hid_host.hpp`
 - `main/usb_hid_host.cpp`, `main/usb_hid_host.hpp`
 - `main/coex_manager.cpp`, `main/coex_manager_stub.cpp`, `main/coex_manager.hpp`
@@ -241,6 +242,13 @@ Summary of what exists; do not regress these:
 - Do not revert the terminal default foreground to the old custom pure green
   (`RGB565(0,255,0)`); it was display-specific. Default fg is an xterm/ANSI
   256-color index (default `255`, white) routed through `color_256()`.
+- Keep idle low-power activity hooks intact: `shell_handle_key` and the
+  `ssh_process_queue` drain (`drained > 0`) must call `power_mark_activity()`,
+  and the main loop must apply the `power_mgr_step()` return as its
+  `vTaskDelay`. Removing these makes the screen sleep during active SSH output
+  or never wake on input. Backlight changes must go through
+  `waveshare_display_set_brightness` (not raw GPIO) so the backlight keepalive
+  task does not revert them. Idle timeout is `POWER_IDLE_TIMEOUT_MS` (30s).
 
 ## Git and Safety Guidance
 
