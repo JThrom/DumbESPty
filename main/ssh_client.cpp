@@ -1,5 +1,6 @@
 #include "ssh_client.hpp"
 #include "shell.hpp"
+#include "power_mgr.hpp"
 #include "wifi_mgr.hpp"
 #include "tailscale_mgr.hpp"
 #include "terminal.hpp"
@@ -2838,7 +2839,12 @@ void ssh_process_queue(void) {
         }
     }
 
-    if (drained > 0 && s_queue_drain_budget > 0) s_queue_drain_budget--;
+    if (drained > 0) {
+        // SSH terminal output counts as activity: keep the screen awake while a
+        // remote session is producing output (e.g. logs, TUI redraws).
+        power_mark_activity();
+        if (s_queue_drain_budget > 0) s_queue_drain_budget--;
+    }
 
     if (ssh_connected && s_rx_diag_budget > 0) {
         TickType_t now = xTaskGetTickCount();
